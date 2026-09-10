@@ -46,6 +46,7 @@ static volatile bool s_playback_running = false;
 static StaticQueue_t s_playback_queue_storage;
 static uint8_t s_playback_queue_buffer[PLAYBACK_QUEUE_DEPTH][PLAYBACK_BLOCK_BYTES];
 static QueueHandle_t s_playback_queue = nullptr;
+static uint8_t s_playback_enqueue_block[PLAYBACK_BLOCK_BYTES];
 
 static void wakeword_task(void *)
 {
@@ -147,9 +148,7 @@ static void playback_task(void *)
             continue;
         }
 
-        if (!s_playback_running) {
-            break;
-        }
+        if (!s_playback_running) break;
 
         size_t samples_written = 0;
         const esp_err_t err = audio_hal_write_pcm(
@@ -173,9 +172,7 @@ static void playback_task(void *)
 
 static bool stop_wakeword_and_wait(void)
 {
-    if (!s_wakeword_running && s_wakeword_task == nullptr) {
-        return true;
-    }
+    if (!s_wakeword_running && s_wakeword_task == nullptr) return true;
 
     s_wakeword_running = false;
     (void)audio_hal_stop_capture();
@@ -487,15 +484,19 @@ extern "C" bool audio_engine_write_speaker_pcm(
                            ? PLAYBACK_BLOCK_SAMPLES
                            : (samples - offset);
 
-        uint8_t block[PLAYBACK_BLOCK_BYTES];
-        memcpy(block, buffer + offset, chunk * sizeof(int16_t));
+        // Static storage keeps the 2 KB queue element off the WebSocket/event
+        // task stack. The current WebSocket event path is serialized.
+        memcpy(s_playback_enqueue_block,
+               buffer + offset,
+               chunk * sizeof(int16_t));
 
         if (chunk < PLAYBACK_BLOCK_SAMPLES) {
-            memset(block + chunk * sizeof(int16_t), 0,
+            memset(s_playback_enqueue_block + chunk * sizeof(int16_t),
+                   0,
                    PLAYBACK_BLOCK_BYTES - chunk * sizeof(int16_t));
         }
 
-        if (xQueueSend(s_playback_queue, block, 0) != pdTRUE) {
+        if (xQueueSend(s_playback_queue, s_playback_enqueue_block, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Speaker playback queue penuh; PCM chunk drop");
             return false;
         }
