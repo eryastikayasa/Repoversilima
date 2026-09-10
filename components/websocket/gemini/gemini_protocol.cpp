@@ -10,8 +10,9 @@
 static const char *TAG = "GEMINI_PROTO";
 
 static constexpr size_t ROLE_MAX = 2048;
+static constexpr size_t SESSION_HANDLE_MAX = 512;
 static constexpr char AUDIO_MIME[] = "audio/pcm;rate=16000";
-static char s_session_handle[512] = {0};
+static char s_session_handle[SESSION_HANDLE_MAX] = {0};
 
 static size_t base64_encoded_size(size_t input_len)
 {
@@ -209,6 +210,25 @@ bool gemini_protocol_process_message(const char *json, size_t len)
         case GEMINI_MESSAGE_TOOL:
             ESP_LOGD(TAG, "Gemini: tool call");
             break;
+        case GEMINI_MESSAGE_SESSION_RESUMPTION: {
+            cJSON *update = cJSON_GetObjectItem(root, "sessionResumptionUpdate");
+            cJSON *resumable = cJSON_GetObjectItem(update, "resumable");
+            cJSON *handle = cJSON_GetObjectItem(update, "newHandle");
+
+            if (cJSON_IsTrue(resumable) && cJSON_IsString(handle) &&
+                handle->valuestring && handle->valuestring[0] != '\0') {
+                const size_t handle_len = strlen(handle->valuestring);
+                if (handle_len < sizeof(s_session_handle)) {
+                    memcpy(s_session_handle, handle->valuestring, handle_len + 1U);
+                    ESP_LOGI(TAG, "Gemini session resumption handle diperbarui");
+                } else {
+                    ESP_LOGW(TAG, "Gemini session handle terlalu panjang");
+                }
+            } else {
+                ESP_LOGD(TAG, "Gemini session belum resumable");
+            }
+            break;
+        }
         default:
             ESP_LOGD(TAG, "Gemini: pesan belum dipetakan");
             break;
