@@ -1,10 +1,8 @@
 #include "websocket_rx.h"
 
-#include "gemini_message.h"
-#include "gemini_protocol.h"
+#include "websocket_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -67,23 +65,7 @@ static void rx_protocol_task(void *)
             continue;
         }
 
-        const int64_t start_us = esp_timer_get_time();
-        const gemini_message_type_t type = gemini_message_classify(msg.buffer, msg.len);
-        const bool handled = gemini_protocol_process_message(msg.buffer, msg.len);
-        const uint32_t process_ms =
-            (uint32_t)((esp_timer_get_time() - start_us) / 1000);
-
-        if (type == GEMINI_MESSAGE_SETUP) {
-            // The event adapter owns the public readiness state. The worker
-            // reports the classification here; readiness is updated by the
-            // event adapter after a complete message is delivered.
-            ESP_LOGI(TAG, "Gemini setupComplete diterima (%u byte, %u ms)",
-                     (unsigned)msg.len, (unsigned)process_ms);
-        } else {
-            ESP_LOGD(TAG, "Gemini RX message type=%d len=%u handled=%d time=%ums",
-                     (int)type, (unsigned)msg.len, handled ? 1 : 0,
-                     (unsigned)process_ms);
-        }
+        websocket_event_process_complete_message(msg.buffer, msg.len);
 
         free(msg.buffer);
         msg = {};
