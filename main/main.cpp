@@ -5,6 +5,8 @@
 #include "display_face.h"
 #include "display_text.h"
 #include "audio_engine.h"
+#include "websocket.h"
+#include "websocket_audio.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -67,6 +69,52 @@ static bool init_wakeword(void)
     return true;
 }
 
+static bool init_websocket(void)
+{
+    const esp_err_t err = websocket_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket init gagal: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "WEBSOCKET READY - menunggu WakeWord");
+    return true;
+}
+
+static bool start_conversation(void)
+{
+    display_face_set_state(FACE_LISTENING);
+    display_text_set_status("Mendengarkan...");
+
+    if (!audio_engine_start_conversation()) {
+        ESP_LOGE(TAG, "Conversation AudioEngine start gagal");
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Audio gagal");
+        return false;
+    }
+
+    const esp_err_t ws_err = websocket_connect();
+    if (ws_err != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket connect gagal: %s", esp_err_to_name(ws_err));
+        audio_engine_stop_conversation();
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Gemini gagal");
+        return false;
+    }
+
+    if (!websocket_audio_start()) {
+        ESP_LOGE(TAG, "WebSocket audio uplink start gagal");
+        websocket_disconnect();
+        audio_engine_stop_conversation();
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Uplink gagal");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "CONVERSATION START: AudioEngine -> WebSocket -> Gemini");
+    return true;
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
@@ -112,6 +160,15 @@ extern "C" void app_main(void)
     display_text_set_status("WiFi OK");
     ESP_LOGI(TAG, "WIFI READY");
 
+    if (!init_websocket()) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("WebSocket gagal");
+        ESP_LOGE(TAG, "WebSocket belum READY - hentikan startup");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
     if (!init_wakeword()) {
         display_face_set_state(FACE_ERROR);
         display_text_set_status("WakeWord gagal");
@@ -125,15 +182,15 @@ extern "C" void app_main(void)
     // Pemrosesan mic dan WakeNet berjalan di dalam AudioEngine.
     while (true) {
         if (audio_engine_wakeword_detected()) {
-            display_face_set_state(FACE_HAPPY);
-            display_text_set_status("HI ESP terdeteksi");
             ESP_LOGI(TAG, "MAIN: WakeWord event");
             audio_engine_clear_wakeword();
 
-            vTaskDelay(pdMS_TO_TICKS(1200));
-
-            display_face_set_state(FACE_IDLE);
-            display_text_set_status("Siap - ucap HI ESP");
+            if (start_conversation()) {
+                // Conversation mode mengambil alih MIC. WakeWord sudah
+                // dihentikan oleh AudioEngine sebelum ownership berpindah.
+                // Audio uplink selanjutnya menunggu Gemini setupComplete.
+                ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE");
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
