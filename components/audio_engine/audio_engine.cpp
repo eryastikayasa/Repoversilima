@@ -7,6 +7,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
+#include <string.h>
+
 namespace {
 
 static const char *TAG = "AUDIO_ENGINE";
