@@ -118,9 +118,11 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
     size_t bytes_read = 0;
     const size_t input_bytes = samples * sizeof(int32_t);
 
+    // Match the proven Repo4 capture behavior: wait for the I2S DMA frame
+    // instead of turning normal capture latency into ESP_ERR_TIMEOUT.
     esp_err_t err = i2s_channel_read(
-        s_rx, s_rx_raw, input_bytes, &bytes_read, pdMS_TO_TICKS(100));
-    if (err != ESP_OK && err != ESP_ERR_TIMEOUT) return err;
+        s_rx, s_rx_raw, input_bytes, &bytes_read, portMAX_DELAY);
+    if (err != ESP_OK) return err;
 
     const size_t count = bytes_read / sizeof(int32_t);
     for (size_t i = 0; i < count; ++i) {
@@ -129,7 +131,7 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
         buffer[i] = (int16_t)(s_rx_raw[i] >> 16);
     }
     *samples_read = count;
-    return err == ESP_ERR_TIMEOUT ? ESP_ERR_TIMEOUT : ESP_OK;
+    return ESP_OK;
 }
 
 esp_err_t audio_hal_start_playback(void)
