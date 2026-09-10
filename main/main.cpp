@@ -4,6 +4,7 @@
 #include "display_engine.h"
 #include "display_face.h"
 #include "display_text.h"
+#include "audio_engine.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -45,6 +46,25 @@ static void init_display(void)
     display_engine_start();
 
     ESP_LOGI(TAG, "DISPLAY READY");
+}
+
+static bool init_wakeword(void)
+{
+    if (!audio_engine_init()) {
+        ESP_LOGE(TAG, "AudioEngine/WakeWord init gagal");
+        return false;
+    }
+
+    if (!audio_engine_start_wakeword()) {
+        ESP_LOGE(TAG, "AudioEngine/WakeWord start gagal");
+        audio_engine_stop();
+        return false;
+    }
+
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("Siap - ucap HI ESP");
+    ESP_LOGI(TAG, "WAKEWORD READY - menunggu HI, ESP");
+    return true;
 }
 
 extern "C" void app_main(void)
@@ -90,11 +110,32 @@ extern "C" void app_main(void)
 
     display_face_set_state(FACE_IDLE);
     display_text_set_status("WiFi OK");
-    ESP_LOGI(TAG, "WIFI READY - Display tahap dasar selesai");
+    ESP_LOGI(TAG, "WIFI READY");
 
-    // Subsystem berikutnya akan ditambahkan bertahap.
-    // Jangan start WakeWord/Audio/WebSocket/Gemini di tahap ini.
+    if (!init_wakeword()) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("WakeWord gagal");
+        ESP_LOGE(TAG, "WakeWord belum READY - hentikan startup");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    // Main hanya bertindak sebagai supervisor event tingkat aplikasi.
+    // Pemrosesan mic dan WakeNet berjalan di dalam AudioEngine.
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (audio_engine_wakeword_detected()) {
+            display_face_set_state(FACE_HAPPY);
+            display_text_set_status("HI ESP terdeteksi");
+            ESP_LOGI(TAG, "MAIN: WakeWord event");
+            audio_engine_clear_wakeword();
+
+            vTaskDelay(pdMS_TO_TICKS(1200));
+
+            display_face_set_state(FACE_IDLE);
+            display_text_set_status("Siap - ucap HI ESP");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
