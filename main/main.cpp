@@ -1,6 +1,10 @@
 #include "web_config.h"
 #include "wifi_manager.h"
 
+#include "display_engine.h"
+#include "display_face.h"
+#include "display_text.h"
+
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -32,6 +36,17 @@ static bool init_nvs(void)
     return true;
 }
 
+static void init_display(void)
+{
+    display_face_init();
+    display_text_init();
+    display_text_set_status("Memulai...");
+    display_engine_init();
+    display_engine_start();
+
+    ESP_LOGI(TAG, "DISPLAY READY");
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
@@ -59,19 +74,26 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "Konfigurasi ditemukan - lanjut Wi-Fi");
 
+    init_display();
+    display_text_set_status("WiFi...");
+
     wifi_init_sta();
 
     if (!wifi_wait_for_connection(30000)) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("WiFi gagal");
         ESP_LOGE(TAG, "Wi-Fi belum READY setelah timeout");
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
-    ESP_LOGI(TAG, "WIFI READY - tahap dasar selesai");
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("WiFi OK");
+    ESP_LOGI(TAG, "WIFI READY - Display tahap dasar selesai");
 
     // Subsystem berikutnya akan ditambahkan bertahap.
-    // Jangan start Display/WakeWord/Audio/WebSocket/Gemini di tahap ini.
+    // Jangan start WakeWord/Audio/WebSocket/Gemini di tahap ini.
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
