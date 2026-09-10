@@ -10,7 +10,58 @@
 static const char *TAG = "GEMINI_PROTO";
 
 static constexpr size_t ROLE_MAX = 2048;
+static constexpr char AUDIO_MIME[] = "audio/pcm;rate=16000";
 static char s_session_handle[512] = {0};
+
+static size_t base64_encoded_size(size_t input_len)
+{
+    return ((input_len + 2U) / 3U) * 4U;
+}
+
+static bool base64_encode(const uint8_t *input, size_t input_len,
+                          char *output, size_t output_size)
+{
+    static constexpr char TABLE[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    if (!input || !output) return false;
+
+    const size_t encoded_len = base64_encoded_size(input_len);
+    if (output_size < encoded_len + 1U) return false;
+
+    size_t in = 0;
+    size_t out = 0;
+
+    while (in + 2U < input_len) {
+        const uint32_t value = (static_cast<uint32_t>(input[in]) << 16) |
+                               (static_cast<uint32_t>(input[in + 1U]) << 8) |
+                               static_cast<uint32_t>(input[in + 2U]);
+        output[out++] = TABLE[(value >> 18) & 0x3F];
+        output[out++] = TABLE[(value >> 12) & 0x3F];
+        output[out++] = TABLE[(value >> 6) & 0x3F];
+        output[out++] = TABLE[value & 0x3F];
+        in += 3U;
+    }
+
+    const size_t remaining = input_len - in;
+    if (remaining == 1U) {
+        const uint32_t value = static_cast<uint32_t>(input[in]) << 16;
+        output[out++] = TABLE[(value >> 18) & 0x3F];
+        output[out++] = TABLE[(value >> 12) & 0x3F];
+        output[out++] = '=';
+        output[out++] = '=';
+    } else if (remaining == 2U) {
+        const uint32_t value = (static_cast<uint32_t>(input[in]) << 16) |
+                               (static_cast<uint32_t>(input[in + 1U]) << 8);
+        output[out++] = TABLE[(value >> 18) & 0x3F];
+        output[out++] = TABLE[(value >> 12) & 0x3F];
+        output[out++] = TABLE[(value >> 6) & 0x3F];
+        output[out++] = '=';
+    }
+
+    output[out] = '\0';
+    return true;
+}
 
 bool gemini_protocol_build_setup(char **output, size_t *output_len)
 {
@@ -76,6 +127,59 @@ bool gemini_protocol_build_setup(char **output, size_t *output_len)
     *output = json;
     *output_len = strlen(json);
     ESP_LOGI(TAG, "Gemini setup siap: AUDIO, id-ID, Kore, AAD");
+    return true;
+}
+
+bool gemini_protocol_build_realtime_audio(const int16_t *pcm16,
+                                          size_t samples,
+                                          char **output,
+                                          size_t *output_len)
+{
+    if (!pcm16 || samples == 0 || !output || !output_len) return false;
+
+    *output = nullptr;
+    *output_len = 0;
+
+    const size_t pcm_bytes = samples * sizeof(int16_t);
+    const size_t encoded_len = base64_encoded_size(pcm_bytes);
+
+    char *encoded = static_cast<char *>(malloc(encoded_len + 1U));
+    if (!encoded) {
+        ESP_LOGE(TAG, "Gagal alokasi Base64 audio (%u byte)",
+                 (unsigned)encoded_len);
+        return false;
+    }
+
+    if (!base64_encode(reinterpret_cast<const uint8_t *>(pcm16), pcm_bytes,
+                       encoded, encoded_len + 1U)) {
+        free(encoded);
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *realtime = root ? cJSON_AddObjectToObject(root, "realtimeInput") : nullptr;
+    cJSON *audio = realtime ? cJSON_AddObjectToObject(realtime, "audio") : nullptr;
+
+    if (!root || !realtime || !audio) {
+        cJSON_Delete(root);
+        free(encoded);
+        return false;
+    }
+
+    cJSON_AddStringToObject(audio, "data", encoded);
+    cJSON_AddStringToObject(audio, "mimeType", AUDIO_MIME);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    free(encoded);
+
+    if (!json) {
+        ESP_LOGE(TAG, "Gagal membuat realtime audio JSON");
+        return false;
+    }
+
+    *output = json;
+    *output_len = strlen(json);
     return true;
 }
 
