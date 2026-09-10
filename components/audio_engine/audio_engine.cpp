@@ -3,16 +3,35 @@
 #include "audio_hal.h"
 #include "wakeword.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr size_t PCM_BLOCK_SAMPLES = 512;
+static constexpr uint32_t WAKEWORD_TASK_DELAY_MS = 1;
+static constexpr uint32_t WAKEWORD_TASK_STACK = 4096;
 
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
+static TaskHandle_t s_wakeword_task = nullptr;
 static bool s_initialized = false;
-static bool s_wakeword_running = false;
-static bool s_wakeword_detected = false;
+static volatile bool s_wakeword_running = false;
+static volatile bool s_wakeword_detected = false;
+
+static void wakeword_task(void *)
+{
+    while (s_wakeword_running) {
+        if (audio_engine_process_wakeword()) {
+            ESP_LOGI(TAG, "WakeWord event diterima AudioEngine");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WAKEWORD_TASK_DELAY_MS));
+    }
+
+    s_wakeword_task = nullptr;
+    vTaskDelete(nullptr);
+}
 
 } // namespace
 
@@ -40,6 +59,7 @@ extern "C" bool audio_engine_init(void)
 
     s_wakeword_detected = false;
     s_wakeword_running = false;
+    s_wakeword_task = nullptr;
     s_initialized = true;
 
     ESP_LOGI(TAG, "AudioEngine ready: MIC -> Audio HAL -> WakeNet");
@@ -66,6 +86,23 @@ extern "C" bool audio_engine_start_wakeword(void)
     }
 
     s_wakeword_running = true;
+
+    const BaseType_t result = xTaskCreate(
+        wakeword_task,
+        "wakeword_task",
+        WAKEWORD_TASK_STACK,
+        nullptr,
+        6,
+        &s_wakeword_task
+    );
+
+    if (result != pdPASS) {
+        s_wakeword_running = false;
+        audio_hal_stop_capture();
+        ESP_LOGE(TAG, "Gagal membuat WakeWord task");
+        return false;
+    }
+
     ESP_LOGI(TAG, "WakeWord capture START");
     return true;
 }
@@ -76,8 +113,8 @@ extern "C" void audio_engine_stop_wakeword(void)
         return;
     }
 
-    audio_hal_stop_capture();
     s_wakeword_running = false;
+    audio_hal_stop_capture();
     ESP_LOGI(TAG, "WakeWord capture STOP");
 }
 
@@ -104,7 +141,6 @@ extern "C" bool audio_engine_process_wakeword(void)
 
     if (wakeword_process_pcm16(s_pcm_buffer, samples_read)) {
         s_wakeword_detected = true;
-        ESP_LOGI(TAG, "WakeWord event diterima AudioEngine");
         return true;
     }
 
