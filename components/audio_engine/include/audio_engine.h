@@ -36,7 +36,7 @@ void audio_engine_stop(void);
  * Start the conversation microphone path.
  *
  * AudioEngine becomes the microphone owner and prepares fixed 20 ms
- * PCM16 mono frames (320 bytes @ 16 kHz). The transport layer may pull
+ * PCM16 mono frames (320 samples @ 16 kHz). The transport layer may pull
  * those prepared frames with audio_engine_read_mic_frame().
  *
  * WakeWord capture must be stopped before starting this path.
@@ -58,6 +58,24 @@ bool audio_engine_read_mic_frame(int16_t *buffer, size_t samples, uint32_t timeo
 
 /** Number of PCM samples in one prepared conversation microphone frame. */
 size_t audio_engine_mic_frame_samples(void);
+
+/** Start the AudioEngine speaker playback path. */
+bool audio_engine_start_playback(void);
+
+/** Stop the AudioEngine speaker playback path. */
+void audio_engine_stop_playback(void);
+
+/** Return true while AudioEngine owns the speaker playback path. */
+bool audio_engine_playback_active(void);
+
+/**
+ * Write PCM16 mono audio to the AudioEngine speaker path.
+ * AudioEngine forwards the samples to Audio HAL using the fixed 24 kHz
+ * speaker configuration. The caller must not access Audio HAL directly.
+ */
+bool audio_engine_write_speaker_pcm(const int16_t *buffer,
+                                    size_t samples,
+                                    uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }
