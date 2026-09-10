@@ -21,9 +21,9 @@ static constexpr size_t MIC_FRAME_BYTES = MIC_FRAME_SAMPLES * sizeof(int16_t);
 static constexpr size_t MIC_QUEUE_DEPTH = 8;
 static constexpr uint32_t CONVERSATION_TASK_STACK = 4096;
 
-// Speaker output is decoupled from the WebSocket event callback. This is
-// required because I2S playback is realtime and can block while the speaker
-// consumes samples. The WebSocket layer only hands PCM to AudioEngine.
+// Speaker output is decoupled from the WebSocket event callback. I2S TX is
+// realtime and may wait for DMA/speaker consumption, so WebSocket must never
+// block on the speaker path.
 static constexpr size_t PLAYBACK_BLOCK_SAMPLES = 1024;
 static constexpr size_t PLAYBACK_BLOCK_BYTES = PLAYBACK_BLOCK_SAMPLES * sizeof(int16_t);
 static constexpr size_t PLAYBACK_QUEUE_DEPTH = 12;
@@ -196,9 +196,7 @@ static bool stop_wakeword_and_wait(void)
 
 extern "C" bool audio_engine_init(void)
 {
-    if (s_initialized) {
-        return true;
-    }
+    if (s_initialized) return true;
 
     ESP_LOGI(TAG, "Initializing AudioEngine");
     audio_hal_init();
@@ -228,7 +226,7 @@ extern "C" bool audio_engine_init(void)
 
     s_playback_queue = xQueueCreateStatic(
         PLAYBACK_QUEUE_DEPTH,
-        PLAYBACK_BLOCK_SAMPLES,
+        PLAYBACK_BLOCK_BYTES,
         &s_playback_queue_buffer[0][0],
         &s_playback_queue_storage);
     if (!s_playback_queue) {
@@ -493,8 +491,6 @@ extern "C" bool audio_engine_write_speaker_pcm(
         memcpy(block, buffer + offset, chunk * sizeof(int16_t));
 
         if (chunk < PLAYBACK_BLOCK_SAMPLES) {
-            // Queue elements have a fixed size. Zero-fill the unused tail;
-            // playback_task always consumes exactly one complete block.
             memset(block + chunk * sizeof(int16_t), 0,
                    PLAYBACK_BLOCK_BYTES - chunk * sizeof(int16_t));
         }
