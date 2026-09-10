@@ -2,6 +2,7 @@
 #include "websocket_transport.h"
 #include "gemini_protocol.h"
 #include "gemini_message.h"
+#include "gemini_audio.h"
 #include "esp_log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +35,9 @@ static void process_complete_message(const char *json, size_t len)
     ESP_LOGI(TAG, "Gemini RX complete: %u byte", (unsigned)len);
 
     const gemini_message_type_t type = gemini_message_classify(json, len);
-    const bool handled = gemini_protocol_process_message(json, len);
+    const bool protocol_handled = gemini_protocol_process_message(json, len);
+    const bool audio_handled = gemini_audio_process_server_message(json, len);
+    const bool handled = protocol_handled || audio_handled;
 
     if (type == GEMINI_MESSAGE_SETUP) {
         s_gemini_ready = true;
@@ -96,11 +99,6 @@ static void handle_data_event(esp_websocket_event_data_t *data)
         return;
     }
 
-    // ESP WebSocket Client reports a fragmented payload through successive
-    // DATA events using payload_offset. Treat offset==0 as a new payload and
-    // assemble by byte offset; do not require continuation opcode 0x00 because
-    // the transport event contract is payload-oriented rather than a raw
-    // WebSocket frame parser.
     if (offset == 0) {
         reset_rx();
         s_rx_expected = payload_len;
