@@ -11,6 +11,7 @@ static volatile bool s_gemini_ready = false;
 
 // Keep RX handling inside the existing event layer. No RX worker/task/queue.
 static constexpr size_t RX_MAX_PAYLOAD = 16 * 1024;
+static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static char s_rx_buffer[RX_MAX_PAYLOAD + 1];
 static size_t s_rx_expected = 0;
 static size_t s_rx_received = 0;
@@ -38,7 +39,12 @@ static void process_complete_message(const char *json, size_t len)
     }
 
     if (!handled) {
+        const size_t log_len = len < RX_DIAGNOSTIC_MAX ? len : RX_DIAGNOSTIC_MAX;
         ESP_LOGW(TAG, "Gemini RX belum dipetakan (%u byte)", (unsigned)len);
+        ESP_LOGW(TAG, "Gemini RX RAW: %.*s", (int)log_len, json);
+        if (len > RX_DIAGNOSTIC_MAX) {
+            ESP_LOGW(TAG, "Gemini RX RAW dipotong pada %u byte", (unsigned)RX_DIAGNOSTIC_MAX);
+        }
     }
 }
 
