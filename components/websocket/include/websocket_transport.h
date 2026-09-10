@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "esp_websocket_client.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +16,9 @@ esp_err_t websocket_transport_disconnect(void);
 bool websocket_transport_is_connected(void);
 esp_err_t websocket_transport_send_text(const char *text, size_t len);
 esp_err_t websocket_transport_send_binary(const uint8_t *data, size_t len);
+
+// Lifecycle hook used only by the WebSocket event adapter.
+void websocket_transport_handle_event(int32_t event_id, void *event_data);
 
 #ifdef __cplusplus
 }
