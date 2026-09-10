@@ -1,13 +1,8 @@
 #include "websocket.h"
 #include "websocket_transport.h"
-#include "websocket_rx.h"
 
 esp_err_t websocket_init(void)
 {
-    if (!websocket_rx_init()) {
-        return ESP_FAIL;
-    }
-
     return websocket_transport_init();
 }
 
