@@ -16,6 +16,10 @@ bool websocket_is_connected(void);
 esp_err_t websocket_send_text(const char *text, size_t len);
 esp_err_t websocket_send_binary(const uint8_t *data, size_t len);
 
+bool websocket_audio_start(void);
+void websocket_audio_stop(void);
+bool websocket_audio_running(void);
+
 #ifdef __cplusplus
 }
 #endif
