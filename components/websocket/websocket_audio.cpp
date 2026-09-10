@@ -12,7 +12,10 @@
 
 static const char *TAG = "WS_AUDIO";
 
-static constexpr size_t FRAME_SAMPLES = 160;
+// AudioEngine conversation contract: 20 ms = 320 samples @ 16 kHz PCM16 mono.
+// Keep this contract identical on both sides; changing only the WS side can
+// make xQueueReceive copy 640 bytes into a smaller destination buffer.
+static constexpr size_t FRAME_SAMPLES = 320;
 static constexpr size_t FRAMES_PER_MESSAGE = 5;
 static constexpr size_t MESSAGE_SAMPLES = FRAME_SAMPLES * FRAMES_PER_MESSAGE;
 static constexpr size_t MESSAGE_BYTES = MESSAGE_SAMPLES * sizeof(int16_t);
@@ -24,11 +27,16 @@ static volatile bool s_running = false;
 
 static void websocket_audio_task(void *)
 {
-    int16_t message_pcm[MESSAGE_SAMPLES];
-    int16_t frame_pcm[FRAME_SAMPLES];
+    static int16_t message_pcm[MESSAGE_SAMPLES];
+    static int16_t frame_pcm[FRAME_SAMPLES];
     size_t frames_collected = 0;
 
-    ESP_LOGI(TAG, "Audio uplink worker START");
+    ESP_LOGI(TAG,
+             "Audio uplink worker START: frame=%u samples/%uB, message=%u samples/%uB",
+             (unsigned)FRAME_SAMPLES,
+             (unsigned)(FRAME_SAMPLES * sizeof(int16_t)),
+             (unsigned)MESSAGE_SAMPLES,
+             (unsigned)MESSAGE_BYTES);
 
     while (s_running) {
         if (!websocket_is_connected() || !websocket_event_gemini_ready()) {
