@@ -1,10 +1,12 @@
 #include "websocket_event.h"
 #include "websocket_transport.h"
 #include "gemini_protocol.h"
+#include "gemini_message.h"
 #include "esp_log.h"
 #include <stdlib.h>
 
 static const char *TAG = "WS_EVENT";
+static volatile bool s_gemini_ready = false;
 
 static void send_gemini_setup(void)
 {
@@ -49,8 +51,16 @@ static void handle_websocket_data(void *event_data)
         return;
     }
 
+    const gemini_message_type_t type = gemini_message_classify(
+        static_cast<const char *>(data->data_ptr), data->data_len);
+
     const bool handled = gemini_protocol_process_message(
         static_cast<const char *>(data->data_ptr), data->data_len);
+
+    if (type == GEMINI_MESSAGE_SETUP) {
+        s_gemini_ready = true;
+        ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+    }
 
     if (!handled) {
         ESP_LOGD(TAG, "Pesan Gemini belum dipetakan (%u byte)",
@@ -70,7 +80,13 @@ void websocket_event_handler(void *handler_args,
 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
+            s_gemini_ready = false;
             send_gemini_setup();
+            break;
+
+        case WEBSOCKET_EVENT_DISCONNECTED:
+        case WEBSOCKET_EVENT_ERROR:
+            s_gemini_ready = false;
             break;
 
         case WEBSOCKET_EVENT_DATA:
@@ -82,4 +98,9 @@ void websocket_event_handler(void *handler_args,
     }
 
     ESP_LOGD(TAG, "WebSocket event=%ld", (long)event_id);
+}
+
+bool websocket_event_gemini_ready(void)
+{
+    return s_gemini_ready;
 }
