@@ -11,7 +11,9 @@ namespace {
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr size_t PCM_BLOCK_SAMPLES = 512;
 static constexpr uint32_t WAKEWORD_TASK_DELAY_MS = 1;
-static constexpr uint32_t WAKEWORD_TASK_STACK = 4096;
+// WakeNet processing and ESP-SR calls need more headroom than the original
+// 4 KB task. Keep the audio buffers static so this stack is for call depth.
+static constexpr uint32_t WAKEWORD_TASK_STACK = 8192;
 
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
 static TaskHandle_t s_wakeword_task = nullptr;
