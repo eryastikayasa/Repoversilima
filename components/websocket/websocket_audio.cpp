@@ -4,6 +4,7 @@
 #include "gemini_protocol.h"
 #include "audio_engine.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdint.h>
@@ -21,6 +22,7 @@ static constexpr size_t MESSAGE_SAMPLES = FRAME_SAMPLES * FRAMES_PER_MESSAGE;
 static constexpr size_t MESSAGE_BYTES = MESSAGE_SAMPLES * sizeof(int16_t);
 static constexpr uint32_t TASK_STACK = 6144;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
+static constexpr int64_t SEND_WARN_US = 80000;
 
 static TaskHandle_t s_task = nullptr;
 static volatile bool s_running = false;
@@ -66,9 +68,17 @@ static void websocket_audio_task(void *)
             continue;
         }
 
+        const int64_t send_start_us = esp_timer_get_time();
         const esp_err_t err = websocket_send_text(json, json_len);
+        const int64_t send_elapsed_us = esp_timer_get_time() - send_start_us;
         free(json);
         frames_collected = 0;
+
+        if (send_elapsed_us >= SEND_WARN_US) {
+            ESP_LOGW(TAG, "Audio uplink send lambat: %lld ms, json=%uB",
+                     (long long)(send_elapsed_us / 1000),
+                     (unsigned)json_len);
+        }
 
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Audio uplink gagal: %s", esp_err_to_name(err));
