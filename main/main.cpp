@@ -7,6 +7,7 @@
 #include "audio_engine.h"
 #include "websocket.h"
 #include "websocket_audio.h"
+#include "websocket_event.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -81,33 +82,77 @@ static bool init_websocket(void)
     return true;
 }
 
+static bool restart_wakeword_after_conversation_failure(void)
+{
+    websocket_disconnect();
+
+    if (!audio_engine_start_wakeword()) {
+        ESP_LOGE(TAG, "Gagal mengembalikan WakeWord setelah conversation gagal");
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("WakeWord gagal");
+        return false;
+    }
+
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("Siap - ucap HI ESP");
+    return true;
+}
+
 static bool start_conversation(void)
 {
     display_face_set_state(FACE_LISTENING);
+    display_text_set_status("Menghubungkan Gemini...");
+
+    // Connect first. AudioEngine must not start consuming MIC into a bounded
+    // queue while the WebSocket/TLS/Gemini setup handshake is still pending.
+    const esp_err_t ws_err = websocket_connect();
+    if (ws_err != ESP_OK) {
+        ESP_LOGE(TAG, "WebSocket connect gagal: %s", esp_err_to_name(ws_err));
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Gemini gagal");
+        restart_wakeword_after_conversation_failure();
+        return false;
+    }
+
+    // Gemini setupComplete is the explicit gate before audio uplink begins.
+    // Give TLS + Gemini handshake enough time without involving AudioEngine.
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+    while (!websocket_event_gemini_ready()) {
+        if (!websocket_is_connected()) {
+            ESP_LOGE(TAG, "WebSocket putus sebelum Gemini setupComplete");
+            display_face_set_state(FACE_ERROR);
+            display_text_set_status("Gemini putus");
+            restart_wakeword_after_conversation_failure();
+            return false;
+        }
+
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            ESP_LOGE(TAG, "Timeout menunggu Gemini setupComplete");
+            display_face_set_state(FACE_ERROR);
+            display_text_set_status("Gemini timeout");
+            restart_wakeword_after_conversation_failure();
+            return false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
     display_text_set_status("Mendengarkan...");
 
     if (!audio_engine_start_conversation()) {
         ESP_LOGE(TAG, "Conversation AudioEngine start gagal");
         display_face_set_state(FACE_ERROR);
         display_text_set_status("Audio gagal");
-        return false;
-    }
-
-    const esp_err_t ws_err = websocket_connect();
-    if (ws_err != ESP_OK) {
-        ESP_LOGE(TAG, "WebSocket connect gagal: %s", esp_err_to_name(ws_err));
-        audio_engine_stop_conversation();
-        display_face_set_state(FACE_ERROR);
-        display_text_set_status("Gemini gagal");
+        restart_wakeword_after_conversation_failure();
         return false;
     }
 
     if (!websocket_audio_start()) {
         ESP_LOGE(TAG, "WebSocket audio uplink start gagal");
-        websocket_disconnect();
         audio_engine_stop_conversation();
         display_face_set_state(FACE_ERROR);
         display_text_set_status("Uplink gagal");
+        restart_wakeword_after_conversation_failure();
         return false;
     }
 
@@ -188,7 +233,6 @@ extern "C" void app_main(void)
             if (start_conversation()) {
                 // Conversation mode mengambil alih MIC. WakeWord sudah
                 // dihentikan oleh AudioEngine sebelum ownership berpindah.
-                // Audio uplink selanjutnya menunggu Gemini setupComplete.
                 ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE");
             }
         }
