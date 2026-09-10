@@ -10,7 +10,10 @@ static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
 
 // Keep RX handling inside the existing event layer. No RX worker/task/queue.
-static constexpr size_t RX_MAX_PAYLOAD = 16 * 1024;
+// Gemini Live audio responses can exceed 16 KB after JSON + base64 encoding.
+// Keep a bounded single-message buffer while preserving the simple event-layer
+// assembly design.
+static constexpr size_t RX_MAX_PAYLOAD = 32 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static char s_rx_buffer[RX_MAX_PAYLOAD + 1];
 static size_t s_rx_expected = 0;
