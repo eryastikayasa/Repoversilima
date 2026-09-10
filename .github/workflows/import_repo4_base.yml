@@ -1,0 +1,75 @@
+name: Import Repo4 Base Components
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo5
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Import proven components from Repo4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf components/wifi_manager \
+                 components/uart_control \
+                 components/web_config \
+                 components/display
+
+          git clone --depth 1 https://github.com/eryastikayasa/Repoversiempat.git /tmp/repoversiempat
+
+          cp -a /tmp/repoversiempat/components/wifi_manager components/
+          cp -a /tmp/repoversiempat/components/uart_control components/
+          cp -a /tmp/repoversiempat/components/web_config components/
+          cp -a /tmp/repoversiempat/components/display components/
+
+          # Main application is intentionally kept empty for the next stage.
+          : > main/main.cpp
+
+          cat > main/CMakeLists.txt <<'EOF'
+          idf_component_register(
+              SRCS "main.cpp"
+              INCLUDE_DIRS "."
+              REQUIRES wifi_manager uart_control web_config display
+          )
+          EOF
+
+          rm -rf /tmp/repoversiempat
+
+      - name: Commit imported base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components/wifi_manager components/uart_control components/web_config components/display main/main.cpp main/CMakeLists.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Import proven Repo4 base components"
+          git push origin HEAD:main
+
+      - name: Remove one-time importer
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/import_repo4_base.yml
+          git add .github/workflows/import_repo4_base.yml
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Remove one-time Repo4 importer"
+          git push origin HEAD:main
