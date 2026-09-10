@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "websocket.cpp"
+        "websocket_transport.cpp"
+        "websocket_event.cpp"
+        "gemini/gemini_protocol.cpp"
+        "gemini/gemini_message.cpp"
+    INCLUDE_DIRS
+        "include"
+        "gemini"
+        "internal"
+    REQUIRES
+        esp_websocket_client
+        cjson
+        web_config
+        audio_engine
+)
