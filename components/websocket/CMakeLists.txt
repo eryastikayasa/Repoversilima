@@ -3,6 +3,7 @@ idf_component_register(
         "websocket.cpp"
         "websocket_transport.cpp"
         "websocket_event.cpp"
+        "websocket_rx.cpp"
         "websocket_audio.cpp"
         "gemini/gemini_protocol.cpp"
         "gemini/gemini_message.cpp"
