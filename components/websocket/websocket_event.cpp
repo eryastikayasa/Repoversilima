@@ -1,13 +1,45 @@
 #include "websocket_event.h"
 #include "websocket_transport.h"
-#include "websocket_rx.h"
 #include "gemini_protocol.h"
 #include "gemini_message.h"
 #include "esp_log.h"
 #include <stdlib.h>
+#include <string.h>
 
 static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
+
+// Gemini control messages are JSON text. Keep fragment handling local to the
+// event layer so the original WebSocket structure does not need an RX worker.
+static constexpr size_t RX_MAX_PAYLOAD = 16 * 1024;
+static char s_rx_buffer[RX_MAX_PAYLOAD + 1];
+static size_t s_rx_expected = 0;
+static size_t s_rx_received = 0;
+static bool s_rx_assembling = false;
+
+static void reset_rx(void)
+{
+    s_rx_expected = 0;
+    s_rx_received = 0;
+    s_rx_assembling = false;
+}
+
+static void process_complete_message(const char *json, size_t len)
+{
+    if (!json || len == 0) return;
+
+    const gemini_message_type_t type = gemini_message_classify(json, len);
+    const bool handled = gemini_protocol_process_message(json, len);
+
+    if (type == GEMINI_MESSAGE_SETUP) {
+        s_gemini_ready = true;
+        ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+    }
+
+    if (!handled) {
+        ESP_LOGD(TAG, "Pesan Gemini belum dipetakan (%u byte)", (unsigned)len);
+    }
+}
 
 static void send_gemini_setup(void)
 {
@@ -29,21 +61,61 @@ static void send_gemini_setup(void)
     free(setup);
 }
 
-extern "C" void websocket_event_process_complete_message(const char *json, size_t len)
+static void handle_data_event(esp_websocket_event_data_t *data)
 {
-    if (!json || len == 0) return;
-
-    const gemini_message_type_t type = gemini_message_classify(json, len);
-    const bool handled = gemini_protocol_process_message(json, len);
-
-    if (type == GEMINI_MESSAGE_SETUP) {
-        s_gemini_ready = true;
-        ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+    if (!data || !data->data_ptr || data->data_len <= 0 || data->payload_len <= 0) {
+        return;
     }
 
-    if (!handled) {
-        ESP_LOGD(TAG, "Pesan Gemini belum dipetakan (%u byte)", (unsigned)len);
+    const size_t payload_len = (size_t)data->payload_len;
+    const size_t offset = (size_t)data->payload_offset;
+    const size_t chunk_len = (size_t)data->data_len;
+
+    if (payload_len > RX_MAX_PAYLOAD ||
+        offset > payload_len ||
+        chunk_len > payload_len - offset) {
+        ESP_LOGW(TAG, "RX payload tidak valid: offset=%u len=%u total=%u",
+                 (unsigned)offset, (unsigned)chunk_len, (unsigned)payload_len);
+        reset_rx();
+        return;
     }
+
+    // Gemini protocol messages are JSON text. 0x01 starts a text message and
+    // 0x00 continues a fragmented text message.
+    if (offset == 0) {
+        if (data->op_code != 0x01) {
+            ESP_LOGD(TAG, "RX non-text frame opcode=0x%02X diabaikan", data->op_code);
+            reset_rx();
+            return;
+        }
+        reset_rx();
+        s_rx_expected = payload_len;
+        s_rx_assembling = true;
+    } else if (!s_rx_assembling ||
+               data->op_code != 0x00 ||
+               s_rx_expected != payload_len ||
+               offset != s_rx_received) {
+        ESP_LOGW(TAG,
+                 "RX fragment sequence tidak valid: opcode=0x%02X offset=%u received=%u expected=%u total=%u",
+                 data->op_code,
+                 (unsigned)offset,
+                 (unsigned)s_rx_received,
+                 (unsigned)s_rx_expected,
+                 (unsigned)payload_len);
+        reset_rx();
+        return;
+    }
+
+    memcpy(s_rx_buffer + offset, data->data_ptr, chunk_len);
+    s_rx_received += chunk_len;
+
+    if (s_rx_received != s_rx_expected) {
+        return;
+    }
+
+    s_rx_buffer[s_rx_expected] = '\0';
+    process_complete_message(s_rx_buffer, s_rx_expected);
+    reset_rx();
 }
 
 void websocket_event_handler(void *handler_args,
@@ -59,23 +131,19 @@ void websocket_event_handler(void *handler_args,
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             s_gemini_ready = false;
-            websocket_rx_reset();
+            reset_rx();
             send_gemini_setup();
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_ERROR:
             s_gemini_ready = false;
-            websocket_rx_reset();
+            reset_rx();
             break;
 
         case WEBSOCKET_EVENT_DATA:
-            // WS callback does transport work only: copy/assemble the frame
-            // and defer Gemini JSON parsing to the RX worker.
-            if (!websocket_rx_enqueue_data(
-                    static_cast<esp_websocket_event_data_t *>(event_data))) {
-                ESP_LOGD(TAG, "WS RX fragment tidak diterima");
-            }
+            handle_data_event(
+                static_cast<esp_websocket_event_data_t *>(event_data));
             break;
 
         default:
