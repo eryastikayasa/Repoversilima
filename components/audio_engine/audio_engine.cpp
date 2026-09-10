@@ -35,6 +35,7 @@ static volatile bool s_conversation_running = false;
 static StaticQueue_t s_mic_queue_storage;
 static uint8_t s_mic_queue_buffer[MIC_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_mic_queue = nullptr;
+static volatile bool s_playback_running = false;
 
 static void wakeword_task(void *)
 {
@@ -189,6 +190,7 @@ extern "C" bool audio_engine_init(void)
     s_wakeword_task = nullptr;
     s_conversation_running = false;
     s_conversation_task = nullptr;
+    s_playback_running = false;
     s_initialized = true;
 
     ESP_LOGI(TAG, "AudioEngine ready: MIC -> Audio HAL -> WakeNet");
@@ -295,6 +297,7 @@ extern "C" void audio_engine_stop(void)
 {
     audio_engine_stop_wakeword();
     audio_engine_stop_conversation();
+    audio_engine_stop_playback();
 }
 
 extern "C" bool audio_engine_start_conversation(void)
@@ -385,4 +388,75 @@ extern "C" bool audio_engine_read_mic_frame(
 extern "C" size_t audio_engine_mic_frame_samples(void)
 {
     return MIC_FRAME_SAMPLES;
+}
+
+extern "C" bool audio_engine_start_playback(void)
+{
+    if (!s_initialized) {
+        ESP_LOGE(TAG, "AudioEngine belum diinisialisasi");
+        return false;
+    }
+
+    if (s_playback_running) {
+        return true;
+    }
+
+    const esp_err_t err = audio_hal_start_playback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Gagal start speaker playback: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    s_playback_running = true;
+    ESP_LOGI(TAG, "Speaker playback START: AudioEngine owns SPK");
+    return true;
+}
+
+extern "C" void audio_engine_stop_playback(void)
+{
+    if (!s_playback_running) {
+        return;
+    }
+
+    const esp_err_t err = audio_hal_stop_playback();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Speaker playback STOP gagal: %s", esp_err_to_name(err));
+    }
+
+    s_playback_running = false;
+    ESP_LOGI(TAG, "Speaker playback STOP: AudioEngine released SPK");
+}
+
+extern "C" bool audio_engine_playback_active(void)
+{
+    return s_playback_running;
+}
+
+extern "C" bool audio_engine_write_speaker_pcm(
+    const int16_t *buffer,
+    size_t samples,
+    uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+
+    if (!buffer || samples == 0 || samples > 1024 || !s_playback_running) {
+        return false;
+    }
+
+    size_t samples_written = 0;
+    const esp_err_t err = audio_hal_write_pcm(
+        buffer,
+        samples,
+        &samples_written);
+
+    if (err != ESP_OK || samples_written != samples) {
+        ESP_LOGW(TAG,
+                 "Speaker PCM write tidak lengkap: requested=%u written=%u err=%s",
+                 (unsigned)samples,
+                 (unsigned)samples_written,
+                 esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
 }
