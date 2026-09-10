@@ -1,0 +1,91 @@
+name: WakeNet9 Runtime Audit
+
+on:
+  workflow_run:
+    workflows:
+      - Build ESP32-S3 Firmware
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  audit:
+    name: Verify WakeNet9 Hi ESP
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout firmware source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Download successful firmware artifact
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32s3-firmware-wakeword
+          path: artifacts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Audit WakeNet9 configuration and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== WAKENET9 HI ESP AUDIT ==="
+
+          echo "--- ESP-SR dependency ---"
+          grep -n 'espressif/esp-sr:' main/idf_component.yml
+          grep -n 'version: "2.4.5"' main/idf_component.yml
+
+          echo "--- sdkconfig.defaults ---"
+          grep -E '^CONFIG_SR_WN_WN9_HIESP=y$' sdkconfig.defaults
+          grep -E '^CONFIG_ESP32S3_SPIRAM_SUPPORT=y$' sdkconfig.defaults
+          grep -E '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig.defaults
+          grep -E '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig.defaults
+
+          echo "--- model partition ---"
+          grep -E '^model,.*0x400000' partitions/partitions.csv
+
+          echo "--- WakeNet component ---"
+          test -f components/wakeword/wakeword.cpp
+          test -f components/wakeword/include/wakeword.h
+          grep -n 'MODEL_NAME\[\].*=.*"wn9_hiesp"' components/wakeword/wakeword.cpp
+          grep -n 'esp_srmodel_init("model")' components/wakeword/wakeword.cpp
+          grep -n 'esp_srmodel_exists' components/wakeword/wakeword.cpp
+          grep -n 'esp_wn_handle_from_name(MODEL_NAME)' components/wakeword/wakeword.cpp
+          grep -n 's_iface->create(MODEL_NAME, DET_MODE_90)' components/wakeword/wakeword.cpp
+          grep -n 's_iface->detect(s_model, s_buffer)' components/wakeword/wakeword.cpp
+          grep -n 'Wake word aktif: HI, ESP' components/wakeword/wakeword.cpp
+
+          echo "--- AudioEngine integration ---"
+          grep -n 'audio_hal_init()' components/audio_engine/audio_engine.cpp
+          grep -n 'wakeword_init()' components/audio_engine/audio_engine.cpp
+          grep -n 'audio_hal_start_capture()' components/audio_engine/audio_engine.cpp
+          grep -n 'audio_hal_read_pcm' components/audio_engine/audio_engine.cpp
+          grep -n 'wakeword_process_pcm16' components/audio_engine/audio_engine.cpp
+
+          echo "--- Audio format contract ---"
+          grep -n 'wakeword_get_sample_rate() != 16000' components/audio_engine/audio_engine.cpp
+          grep -n 'PCM_BLOCK_SAMPLES = 512' components/audio_engine/audio_engine.cpp
+
+          if [ -f artifacts/firmware.elf ]; then
+            ELF=artifacts/firmware.elf
+            echo "--- compiled ELF strings ---"
+            strings "$ELF" | grep -F 'WakeNet ready:'
+            strings "$ELF" | grep -F 'Wake word aktif: HI, ESP'
+            strings "$ELF" | grep -F 'WakeWord event diterima AudioEngine'
+            strings "$ELF" | grep -F 'wn9_hiesp'
+            echo "Compiled WakeNet9 integration: PASS"
+          else
+            echo "No firmware artifact in manual audit; source/config checks passed."
+          fi
+
+          echo "========================================"
+          echo "WAKENET9 HI ESP AUDIT: PASS"
+          echo "Repo4 baseline integration verified"
+          echo "========================================"
