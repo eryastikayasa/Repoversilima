@@ -16,6 +16,8 @@ gemini_message_type_t gemini_message_classify(const char *json, size_t len)
         type = GEMINI_MESSAGE_SETUP;
     } else if (cJSON_GetObjectItem(root, "toolCall")) {
         type = GEMINI_MESSAGE_TOOL;
+    } else if (cJSON_GetObjectItem(root, "sessionResumptionUpdate")) {
+        type = GEMINI_MESSAGE_SESSION_RESUMPTION;
     } else if (cJSON_GetObjectItem(root, "serverContent")) {
         cJSON *server = cJSON_GetObjectItem(root, "serverContent");
         if (cJSON_IsObject(server) && cJSON_GetObjectItem(server, "modelTurn")) {
