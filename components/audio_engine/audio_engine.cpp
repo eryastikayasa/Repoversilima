@@ -14,15 +14,20 @@ namespace {
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr size_t PCM_BLOCK_SAMPLES = 512;
 static constexpr uint32_t WAKEWORD_TASK_DELAY_MS = 1;
-// WakeNet processing and ESP-SR calls need more headroom than the original
-// 4 KB task. Keep the audio buffers static so this stack is for call depth.
 static constexpr uint32_t WAKEWORD_TASK_STACK = 8192;
 
-// Conversation input contract: 20 ms @ 16 kHz PCM16 mono = 320 bytes.
 static constexpr size_t MIC_FRAME_SAMPLES = 320;
 static constexpr size_t MIC_FRAME_BYTES = MIC_FRAME_SAMPLES * sizeof(int16_t);
 static constexpr size_t MIC_QUEUE_DEPTH = 8;
 static constexpr uint32_t CONVERSATION_TASK_STACK = 4096;
+
+// Speaker output is decoupled from the WebSocket event callback. This is
+// required because I2S playback is realtime and can block while the speaker
+// consumes samples. The WebSocket layer only hands PCM to AudioEngine.
+static constexpr size_t PLAYBACK_BLOCK_SAMPLES = 1024;
+static constexpr size_t PLAYBACK_BLOCK_BYTES = PLAYBACK_BLOCK_SAMPLES * sizeof(int16_t);
+static constexpr size_t PLAYBACK_QUEUE_DEPTH = 12;
+static constexpr uint32_t PLAYBACK_TASK_STACK = 4096;
 
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
 static TaskHandle_t s_wakeword_task = nullptr;
@@ -35,7 +40,12 @@ static volatile bool s_conversation_running = false;
 static StaticQueue_t s_mic_queue_storage;
 static uint8_t s_mic_queue_buffer[MIC_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_mic_queue = nullptr;
+
+static TaskHandle_t s_playback_task = nullptr;
 static volatile bool s_playback_running = false;
+static StaticQueue_t s_playback_queue_storage;
+static uint8_t s_playback_queue_buffer[PLAYBACK_QUEUE_DEPTH][PLAYBACK_BLOCK_BYTES];
+static QueueHandle_t s_playback_queue = nullptr;
 
 static void wakeword_task(void *)
 {
@@ -43,7 +53,6 @@ static void wakeword_task(void *)
         if (audio_engine_process_wakeword()) {
             ESP_LOGI(TAG, "WakeWord event diterima AudioEngine");
         }
-
         vTaskDelay(pdMS_TO_TICKS(WAKEWORD_TASK_DELAY_MS));
     }
 
@@ -53,7 +62,6 @@ static void wakeword_task(void *)
 
 static void conversation_task(void *)
 {
-    // Static storage keeps realtime audio buffers off the task stack.
     static int16_t read_buffer[PCM_BLOCK_SAMPLES];
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
     size_t frame_pos = 0;
@@ -104,9 +112,6 @@ static void conversation_task(void *)
             }
 
             frame_pos = 0;
-
-            // Queue is deliberately bounded and non-blocking. AudioEngine
-            // never waits for WebSocket/network consumption while owning MIC.
             if (xQueueSend(s_mic_queue, frame_buffer, 0) != pdTRUE) {
                 static uint32_t drops = 0;
                 ++drops;
@@ -118,12 +123,51 @@ static void conversation_task(void *)
             }
         }
 
-        // One tick prevents a continuous capture loop from monopolizing CPU.
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     s_conversation_task = nullptr;
     ESP_LOGI(TAG, "Conversation MIC owner STOP");
+    vTaskDelete(nullptr);
+}
+
+static void playback_task(void *)
+{
+    static int16_t playback_buffer[PLAYBACK_BLOCK_SAMPLES];
+
+    ESP_LOGI(TAG,
+             "Speaker playback task START: 24kHz PCM16, block=%u samples, queue=%u",
+             (unsigned)PLAYBACK_BLOCK_SAMPLES,
+             (unsigned)PLAYBACK_QUEUE_DEPTH);
+
+    while (s_playback_running) {
+        if (xQueueReceive(s_playback_queue,
+                          playback_buffer,
+                          pdMS_TO_TICKS(20)) != pdTRUE) {
+            continue;
+        }
+
+        if (!s_playback_running) {
+            break;
+        }
+
+        size_t samples_written = 0;
+        const esp_err_t err = audio_hal_write_pcm(
+            playback_buffer,
+            PLAYBACK_BLOCK_SAMPLES,
+            &samples_written);
+
+        if (err != ESP_OK || samples_written != PLAYBACK_BLOCK_SAMPLES) {
+            ESP_LOGW(TAG,
+                     "Speaker PCM write tidak lengkap: requested=%u written=%u err=%s",
+                     (unsigned)PLAYBACK_BLOCK_SAMPLES,
+                     (unsigned)samples_written,
+                     esp_err_to_name(err));
+        }
+    }
+
+    s_playback_task = nullptr;
+    ESP_LOGI(TAG, "Speaker playback task STOP");
     vTaskDelete(nullptr);
 }
 
@@ -136,8 +180,6 @@ static bool stop_wakeword_and_wait(void)
     s_wakeword_running = false;
     (void)audio_hal_stop_capture();
 
-    // The proven WakeWord task uses a blocking Audio HAL read. Stopping the
-    // channel releases that read; wait briefly for task ownership to clear.
     for (uint32_t i = 0; i < 100 && s_wakeword_task != nullptr; ++i) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -159,7 +201,6 @@ extern "C" bool audio_engine_init(void)
     }
 
     ESP_LOGI(TAG, "Initializing AudioEngine");
-
     audio_hal_init();
 
     if (!wakeword_init()) {
@@ -185,12 +226,24 @@ extern "C" bool audio_engine_init(void)
         return false;
     }
 
+    s_playback_queue = xQueueCreateStatic(
+        PLAYBACK_QUEUE_DEPTH,
+        PLAYBACK_BLOCK_SAMPLES,
+        &s_playback_queue_buffer[0][0],
+        &s_playback_queue_storage);
+    if (!s_playback_queue) {
+        ESP_LOGE(TAG, "Gagal membuat speaker playback queue");
+        wakeword_deinit();
+        return false;
+    }
+
     s_wakeword_detected = false;
     s_wakeword_running = false;
     s_wakeword_task = nullptr;
     s_conversation_running = false;
     s_conversation_task = nullptr;
     s_playback_running = false;
+    s_playback_task = nullptr;
     s_initialized = true;
 
     ESP_LOGI(TAG, "AudioEngine ready: MIC -> Audio HAL -> WakeNet");
@@ -203,18 +256,13 @@ extern "C" bool audio_engine_start_wakeword(void)
         ESP_LOGE(TAG, "AudioEngine belum diinisialisasi");
         return false;
     }
-
-    if (s_wakeword_running) {
-        return true;
-    }
-
+    if (s_wakeword_running) return true;
     if (s_conversation_running) {
         ESP_LOGE(TAG, "Tidak bisa start WakeWord saat conversation MIC aktif");
         return false;
     }
 
     s_wakeword_detected = false;
-
     const esp_err_t err = audio_hal_start_capture();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Gagal start MIC capture: %s", esp_err_to_name(err));
@@ -222,15 +270,9 @@ extern "C" bool audio_engine_start_wakeword(void)
     }
 
     s_wakeword_running = true;
-
     const BaseType_t result = xTaskCreate(
-        wakeword_task,
-        "wakeword_task",
-        WAKEWORD_TASK_STACK,
-        nullptr,
-        6,
-        &s_wakeword_task
-    );
+        wakeword_task, "wakeword_task", WAKEWORD_TASK_STACK,
+        nullptr, 6, &s_wakeword_task);
 
     if (result != pdPASS) {
         s_wakeword_running = false;
@@ -245,10 +287,7 @@ extern "C" bool audio_engine_start_wakeword(void)
 
 extern "C" void audio_engine_stop_wakeword(void)
 {
-    if (!s_wakeword_running) {
-        return;
-    }
-
+    if (!s_wakeword_running) return;
     s_wakeword_running = false;
     audio_hal_stop_capture();
     ESP_LOGI(TAG, "WakeWord capture STOP");
@@ -256,30 +295,22 @@ extern "C" void audio_engine_stop_wakeword(void)
 
 extern "C" bool audio_engine_process_wakeword(void)
 {
-    if (!s_initialized || !s_wakeword_running) {
-        return false;
-    }
+    if (!s_initialized || !s_wakeword_running) return false;
 
     size_t samples_read = 0;
     const esp_err_t err = audio_hal_read_pcm(
-        s_pcm_buffer,
-        PCM_BLOCK_SAMPLES,
-        &samples_read);
+        s_pcm_buffer, PCM_BLOCK_SAMPLES, &samples_read);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Audio HAL read gagal: %s", esp_err_to_name(err));
         return false;
     }
-
-    if (samples_read == 0) {
-        return false;
-    }
+    if (samples_read == 0) return false;
 
     if (wakeword_process_pcm16(s_pcm_buffer, samples_read)) {
         s_wakeword_detected = true;
         return true;
     }
-
     return false;
 }
 
@@ -306,16 +337,10 @@ extern "C" bool audio_engine_start_conversation(void)
         ESP_LOGE(TAG, "AudioEngine belum diinisialisasi");
         return false;
     }
+    if (s_conversation_running) return true;
 
-    if (s_conversation_running) {
-        return true;
-    }
+    if (!stop_wakeword_and_wait()) return false;
 
-    if (!stop_wakeword_and_wait()) {
-        return false;
-    }
-
-    // The conversation path owns MIC after WakeWord releases it.
     if (audio_hal_start_capture() != ESP_OK) {
         ESP_LOGE(TAG, "Gagal start MIC capture untuk conversation");
         return false;
@@ -346,9 +371,7 @@ extern "C" bool audio_engine_start_conversation(void)
 
 extern "C" void audio_engine_stop_conversation(void)
 {
-    if (!s_conversation_running && s_conversation_task == nullptr) {
-        return;
-    }
+    if (!s_conversation_running && s_conversation_task == nullptr) return;
 
     s_conversation_running = false;
     (void)audio_hal_stop_capture();
@@ -371,9 +394,7 @@ extern "C" bool audio_engine_read_mic_frame(
     size_t samples,
     uint32_t timeout_ms)
 {
-    if (!buffer || samples != MIC_FRAME_SAMPLES || !s_mic_queue) {
-        return false;
-    }
+    if (!buffer || samples != MIC_FRAME_SAMPLES || !s_mic_queue) return false;
 
     TickType_t wait_ticks = 0;
     if (timeout_ms == UINT32_MAX) {
@@ -396,10 +417,7 @@ extern "C" bool audio_engine_start_playback(void)
         ESP_LOGE(TAG, "AudioEngine belum diinisialisasi");
         return false;
     }
-
-    if (s_playback_running) {
-        return true;
-    }
+    if (s_playback_running) return true;
 
     const esp_err_t err = audio_hal_start_playback();
     if (err != ESP_OK) {
@@ -407,15 +425,38 @@ extern "C" bool audio_engine_start_playback(void)
         return false;
     }
 
+    xQueueReset(s_playback_queue);
     s_playback_running = true;
+
+    const BaseType_t result = xTaskCreate(
+        playback_task,
+        "audio_playback",
+        PLAYBACK_TASK_STACK,
+        nullptr,
+        5,
+        &s_playback_task);
+
+    if (result != pdPASS) {
+        s_playback_running = false;
+        audio_hal_stop_playback();
+        s_playback_task = nullptr;
+        ESP_LOGE(TAG, "Gagal membuat speaker playback task");
+        return false;
+    }
+
     ESP_LOGI(TAG, "Speaker playback START: AudioEngine owns SPK");
     return true;
 }
 
 extern "C" void audio_engine_stop_playback(void)
 {
-    if (!s_playback_running) {
-        return;
+    if (!s_playback_running && s_playback_task == nullptr) return;
+
+    s_playback_running = false;
+    xQueueReset(s_playback_queue);
+
+    for (uint32_t i = 0; i < 100 && s_playback_task != nullptr; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     const esp_err_t err = audio_hal_stop_playback();
@@ -423,7 +464,6 @@ extern "C" void audio_engine_stop_playback(void)
         ESP_LOGW(TAG, "Speaker playback STOP gagal: %s", esp_err_to_name(err));
     }
 
-    s_playback_running = false;
     ESP_LOGI(TAG, "Speaker playback STOP: AudioEngine released SPK");
 }
 
@@ -439,23 +479,32 @@ extern "C" bool audio_engine_write_speaker_pcm(
 {
     (void)timeout_ms;
 
-    if (!buffer || samples == 0 || samples > 1024 || !s_playback_running) {
+    if (!buffer || samples == 0 || !s_playback_running || !s_playback_queue) {
         return false;
     }
 
-    size_t samples_written = 0;
-    const esp_err_t err = audio_hal_write_pcm(
-        buffer,
-        samples,
-        &samples_written);
+    size_t offset = 0;
+    while (offset < samples) {
+        const size_t chunk = (samples - offset) > PLAYBACK_BLOCK_SAMPLES
+                           ? PLAYBACK_BLOCK_SAMPLES
+                           : (samples - offset);
 
-    if (err != ESP_OK || samples_written != samples) {
-        ESP_LOGW(TAG,
-                 "Speaker PCM write tidak lengkap: requested=%u written=%u err=%s",
-                 (unsigned)samples,
-                 (unsigned)samples_written,
-                 esp_err_to_name(err));
-        return false;
+        uint8_t block[PLAYBACK_BLOCK_BYTES];
+        memcpy(block, buffer + offset, chunk * sizeof(int16_t));
+
+        if (chunk < PLAYBACK_BLOCK_SAMPLES) {
+            // Queue elements have a fixed size. Zero-fill the unused tail;
+            // playback_task always consumes exactly one complete block.
+            memset(block + chunk * sizeof(int16_t), 0,
+                   PLAYBACK_BLOCK_BYTES - chunk * sizeof(int16_t));
+        }
+
+        if (xQueueSend(s_playback_queue, block, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Speaker playback queue penuh; PCM chunk drop");
+            return false;
+        }
+
+        offset += chunk;
     }
 
     return true;
