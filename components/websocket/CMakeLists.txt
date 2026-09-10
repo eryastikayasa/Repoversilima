@@ -6,6 +6,7 @@ idf_component_register(
         "websocket_audio.cpp"
         "gemini/gemini_protocol.cpp"
         "gemini/gemini_message.cpp"
+        "gemini/gemini_audio.cpp"
     INCLUDE_DIRS
         "include"
         "gemini"
@@ -13,6 +14,7 @@ idf_component_register(
     REQUIRES
         esp_websocket_client
         cjson
+        mbedtls
         web_config
         audio_engine
 )
