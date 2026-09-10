@@ -15,9 +15,7 @@ static bool s_logged_first_audio = false;
 
 static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
 {
-    if (!data || bytes == 0 || (bytes & 1U) != 0) {
-        return false;
-    }
+    if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
 
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     size_t remaining = bytes / sizeof(int16_t);
@@ -25,7 +23,7 @@ static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
     while (remaining > 0) {
         const size_t chunk = remaining > 1024 ? 1024 : remaining;
         if (!audio_engine_write_speaker_pcm(pcm, chunk, 100)) {
-            ESP_LOGW(TAG, "Gagal menulis PCM speaker: samples=%u", (unsigned)chunk);
+            ESP_LOGW(TAG, "Gagal enqueue PCM speaker: samples=%u", (unsigned)chunk);
             return false;
         }
         pcm += chunk;
@@ -93,14 +91,10 @@ static bool process_inline_audio(cJSON *inline_data)
 
 bool gemini_audio_process_server_message(const char *json, size_t len)
 {
-    if (!json || len == 0) {
-        return false;
-    }
+    if (!json || len == 0) return false;
 
     cJSON *root = cJSON_ParseWithLength(json, len);
-    if (!root) {
-        return false;
-    }
+    if (!root) return false;
 
     bool handled = false;
     cJSON *server_content = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
@@ -126,9 +120,7 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         const int count = cJSON_GetArraySize(parts);
         for (int i = 0; i < count; ++i) {
             cJSON *part = cJSON_GetArrayItem(parts, i);
-            if (!cJSON_IsObject(part)) {
-                continue;
-            }
+            if (!cJSON_IsObject(part)) continue;
 
             cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
             if (cJSON_IsObject(inline_data) && process_inline_audio(inline_data)) {
@@ -137,13 +129,11 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         }
     }
 
+    // turnComplete only means Gemini has finished sending this model turn.
+    // PCM may still be queued inside AudioEngine, so do not stop I2S here.
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
-        if (s_playback_active) {
-            audio_engine_stop_playback();
-            s_playback_active = false;
-            ESP_LOGI(TAG, "Turn complete: playback STOP");
-        }
+        ESP_LOGI(TAG, "Turn complete: PCM playback dibiarkan drain");
         handled = true;
     }
 
