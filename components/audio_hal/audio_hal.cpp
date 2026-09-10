@@ -24,6 +24,10 @@ static bool s_initialized = false;
 static bool s_capture_started = false;
 static bool s_playback_started = false;
 
+// Keep the temporary I2S conversion buffer out of the WakeWord task stack.
+// 1024 x 32-bit = 4096 bytes.
+static int32_t s_rx_raw[1024];
+
 void audio_hal_init(void)
 {
     if (s_initialized) {
@@ -107,25 +111,22 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
     if (samples_read) *samples_read = 0;
     if (!buffer || samples == 0 || !samples_read) return ESP_ERR_INVALID_ARG;
     if (!s_capture_started || !s_rx) return ESP_ERR_INVALID_STATE;
+    if (samples > 1024) return ESP_ERR_INVALID_SIZE;
 
     // INMP441 arrives as 32-bit samples. Keep conversion here, at the HAL
     // boundary, so every upper layer receives only signed PCM16 mono.
     size_t bytes_read = 0;
     const size_t input_bytes = samples * sizeof(int32_t);
 
-    // Use a bounded temporary buffer sized for the caller's request.
-    // Normal callers should request modest audio frames (e.g. 160-512 samples).
-    if (samples > 1024) return ESP_ERR_INVALID_SIZE;
-
-    int32_t raw[1024];
-    esp_err_t err = i2s_channel_read(s_rx, raw, input_bytes, &bytes_read, pdMS_TO_TICKS(100));
+    esp_err_t err = i2s_channel_read(
+        s_rx, s_rx_raw, input_bytes, &bytes_read, pdMS_TO_TICKS(100));
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT) return err;
 
     const size_t count = bytes_read / sizeof(int32_t);
     for (size_t i = 0; i < count; ++i) {
         // INMP441/Repo4 proven path uses the high 16 bits of the 32-bit I2S
         // sample as the internal PCM16 representation.
-        buffer[i] = (int16_t)(raw[i] >> 16);
+        buffer[i] = (int16_t)(s_rx_raw[i] >> 16);
     }
     *samples_read = count;
     return err == ESP_ERR_TIMEOUT ? ESP_ERR_TIMEOUT : ESP_OK;
