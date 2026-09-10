@@ -24,9 +24,10 @@ static bool s_initialized = false;
 static bool s_capture_started = false;
 static bool s_playback_started = false;
 
-// Keep the temporary I2S conversion buffer out of the WakeWord task stack.
-// 1024 x 32-bit = 4096 bytes.
+// Keep the temporary I2S conversion buffers out of task stacks.
+// 1024 x 32-bit = 4096 bytes each.
 static int32_t s_rx_raw[1024];
+static int32_t s_tx_raw[1024];
 
 void audio_hal_init(void)
 {
@@ -169,13 +170,12 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
 
     // Speaker I2S is configured as 32-bit. Expand PCM16 to the 32-bit
     // left-justified representation used by the proven Repo4 path.
-    int32_t raw[1024];
     for (size_t i = 0; i < samples; ++i)
-        raw[i] = ((int32_t)buffer[i]) << 16;
+        s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
 
     size_t bytes_written = 0;
     esp_err_t err = i2s_channel_write(
-        s_tx, raw, samples * sizeof(int32_t), &bytes_written, pdMS_TO_TICKS(100));
+        s_tx, s_tx_raw, samples * sizeof(int32_t), &bytes_written, pdMS_TO_TICKS(100));
 
     *samples_written = bytes_written / sizeof(int32_t);
     return err;
