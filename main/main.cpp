@@ -103,8 +103,9 @@ static bool start_conversation(void)
     display_face_set_state(FACE_LISTENING);
     display_text_set_status("Menghubungkan Gemini...");
 
-    // Connect first. AudioEngine must not start consuming MIC into a bounded
-    // queue while the WebSocket/TLS/Gemini setup handshake is still pending.
+    // websocket_connect() starts the client asynchronously. Do not interpret
+    // the initial NOT-CONNECTED state as a failure; wait for the CONNECTED
+    // event while keeping the Gemini setupComplete gate below.
     const esp_err_t ws_err = websocket_connect();
     if (ws_err != ESP_OK) {
         ESP_LOGE(TAG, "WebSocket connect gagal: %s", esp_err_to_name(ws_err));
@@ -114,24 +115,18 @@ static bool start_conversation(void)
         return false;
     }
 
-    // Gemini setupComplete is the explicit gate before audio uplink begins.
-    // Give TLS + Gemini handshake enough time without involving AudioEngine.
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
     while (!websocket_event_gemini_ready()) {
-        if (!websocket_is_connected()) {
-            ESP_LOGE(TAG, "WebSocket putus sebelum Gemini setupComplete");
-            display_face_set_state(FACE_ERROR);
-            display_text_set_status("Gemini putus");
-            restart_wakeword_after_conversation_failure();
-            return false;
-        }
-
         if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
             ESP_LOGE(TAG, "Timeout menunggu Gemini setupComplete");
             display_face_set_state(FACE_ERROR);
             display_text_set_status("Gemini timeout");
             restart_wakeword_after_conversation_failure();
             return false;
+        }
+
+        if (!websocket_is_connected()) {
+            ESP_LOGD(TAG, "Menunggu WebSocket CONNECTED/Gemini setupComplete...");
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -173,9 +168,6 @@ extern "C" void app_main(void)
         }
     }
 
-    // WebConfig menjadi gerbang konfigurasi pertama.
-    // Jika SSID/API key belum tersedia, perangkat masuk AP Config Mode
-    // dan tidak melanjutkan ke subsystem berikutnya.
     if (web_config_is_needed()) {
         ESP_LOGW(TAG, "Konfigurasi belum siap - masuk WebConfig");
         web_config_start();
@@ -223,16 +215,12 @@ extern "C" void app_main(void)
         }
     }
 
-    // Main hanya bertindak sebagai supervisor event tingkat aplikasi.
-    // Pemrosesan mic dan WakeNet berjalan di dalam AudioEngine.
     while (true) {
         if (audio_engine_wakeword_detected()) {
             ESP_LOGI(TAG, "MAIN: WakeWord event");
             audio_engine_clear_wakeword();
 
             if (start_conversation()) {
-                // Conversation mode mengambil alih MIC. WakeWord sudah
-                // dihentikan oleh AudioEngine sebelum ownership berpindah.
                 ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE");
             }
         }
