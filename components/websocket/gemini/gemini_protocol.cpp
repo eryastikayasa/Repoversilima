@@ -184,6 +184,36 @@ bool gemini_protocol_build_realtime_audio(const int16_t *pcm16,
     return true;
 }
 
+bool gemini_protocol_build_realtime_text(const char *text,
+                                         char **output,
+                                         size_t *output_len)
+{
+    if (!text || text[0] == '\0' || !output || !output_len) return false;
+
+    *output = nullptr;
+    *output_len = 0;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *realtime = root ? cJSON_AddObjectToObject(root, "realtimeInput") : nullptr;
+    if (!root || !realtime) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON_AddStringToObject(realtime, "text", text);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        ESP_LOGE(TAG, "Gagal membuat realtime text JSON");
+        return false;
+    }
+
+    *output = json;
+    *output_len = strlen(json);
+    return true;
+}
+
 bool gemini_protocol_process_message(const char *json, size_t len)
 {
     if (!json || len == 0) return false;
