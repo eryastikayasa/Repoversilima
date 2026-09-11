@@ -65,7 +65,7 @@ void audio_hal_init(void)
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
     tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
         I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
-    // Match the proven Repo4 speaker configuration exactly.
+    // Repo5 TX format: 32-bit slot, LEFT mono, Philips standard mode.
     tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
     tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
@@ -164,54 +164,49 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
     if (samples > 1024) return ESP_ERR_INVALID_SIZE;
 
     // Speaker I2S is configured as 32-bit. Expand PCM16 to the 32-bit
-    // left-justified representation used by the proven Repo4 path.
+    // left-justified representation used by the Repo5 TX format.
     for (size_t i = 0; i < samples; ++i) {
         s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
     }
 
-    // The DMA configuration uses 240-sample frames. Keep each I2S write at
-    // one DMA frame, matching the proven Repo4 speaker path. This avoids
-    // relying on larger driver transfers while preserving partial-write
-    // continuation when the DMA ring accepts less than one frame.
-    constexpr size_t I2S_WRITE_SAMPLES = 240;
-    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
-
+    // Repo5 playback task owns this blocking hardware boundary. Do not split
+    // the block merely to match a DMA frame size. If the driver accepts only
+    // part of the block before a timeout, continue from the actual progress
+    // instead of dropping the unwritten PCM.
     size_t total_written = 0;
     while (total_written < samples) {
-        const size_t remaining = samples - total_written;
-        const size_t chunk = remaining > I2S_WRITE_SAMPLES
-                           ? I2S_WRITE_SAMPLES
-                           : remaining;
-
         size_t bytes_written = 0;
+        const size_t remaining_bytes =
+            (samples - total_written) * sizeof(int32_t);
+
         const esp_err_t err = i2s_channel_write(
             s_tx,
             s_tx_raw + total_written,
-            chunk * sizeof(int32_t),
+            remaining_bytes,
             &bytes_written,
-            pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
+            portMAX_DELAY);
 
         size_t chunk_written = bytes_written / sizeof(int32_t);
-        if (chunk_written > chunk) chunk_written = chunk;
+        if (chunk_written > (samples - total_written)) {
+            chunk_written = samples - total_written;
+        }
         total_written += chunk_written;
 
-        if (err != ESP_OK || chunk_written != chunk) {
+        if (err != ESP_OK) {
             *samples_written = total_written;
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG,
-                         "I2S speaker write fail: err=%s written=%u/%u",
-                         esp_err_to_name(err),
-                         (unsigned)bytes_written,
-                         (unsigned)(chunk * sizeof(int32_t)));
-                vTaskDelay(pdMS_TO_TICKS(1));
-                return err;
-            }
-
-            // No progress without an error is treated as a bounded failure.
             ESP_LOGW(TAG,
-                     "I2S speaker write tidak lengkap: written=%u/%u",
+                     "I2S speaker write fail: err=%s written=%u/%u",
+                     esp_err_to_name(err),
                      (unsigned)bytes_written,
-                     (unsigned)(chunk * sizeof(int32_t)));
+                     (unsigned)remaining_bytes);
+            return err;
+        }
+
+        if (chunk_written == 0) {
+            *samples_written = total_written;
+            ESP_LOGW(TAG,
+                     "I2S speaker write tidak ada progress: requested=%u",
+                     (unsigned)remaining_bytes);
             return ESP_ERR_TIMEOUT;
         }
     }
