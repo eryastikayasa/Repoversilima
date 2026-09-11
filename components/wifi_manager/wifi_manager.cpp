@@ -21,8 +21,8 @@ static EventGroupHandle_t s_wifi_event_group = NULL;
 
 static volatile bool s_wifi_started = false;
 static volatile bool s_wifi_got_ip = false;
-static volatile uint32_t s_wifi_disconnect_count = 0;
-static volatile uint8_t s_wifi_last_disconnect_reason = 0;
+static uint32_t s_wifi_disconnect_count = 0;
+static uint8_t s_wifi_last_disconnect_reason = 0;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -243,7 +243,7 @@ void wifi_log_diagnostic(void)
         return;
     }
 
-    wifi_phy_mode_t phymode = WIFI_PHY_MODE_NONE;
+    wifi_phy_mode_t phymode = WIFI_PHY_MODE_11B;
     const esp_err_t phy_err = esp_wifi_sta_get_negotiated_phymode(&phymode);
 
     wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
