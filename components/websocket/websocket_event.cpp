@@ -5,6 +5,7 @@
 #include "gemini_audio.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -22,6 +23,8 @@ static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static constexpr size_t RX_BUFFER_COUNT = 6;
 static constexpr uint32_t RX_WORKER_STACK = 8192;
 static constexpr UBaseType_t RX_WORKER_PRIORITY = 5;
+static constexpr uint32_t RX_DIAGNOSTIC_EVERY = 10;
+static constexpr int64_t RX_PROCESS_WARN_US = 50000;
 
 static QueueHandle_t s_rx_free_queue = nullptr;
 static QueueHandle_t s_rx_ready_queue = nullptr;
@@ -79,6 +82,8 @@ static bool ensure_rx_worker(void)
                      (unsigned)RX_BUFFER_COUNT,
                      (unsigned)(RX_MAX_PAYLOAD / 1024));
 
+            uint32_t process_count = 0;
+
             while (true) {
                 char *json = nullptr;
                 if (xQueueReceive(s_rx_ready_queue, &json, portMAX_DELAY) != pdPASS) {
@@ -88,12 +93,40 @@ static bool ensure_rx_worker(void)
                 if (!json) continue;
 
                 const size_t len = strlen(json);
-                ESP_LOGI(TAG, "Gemini RX worker process: %u byte", (unsigned)len);
+                const int64_t process_start_us = esp_timer_get_time();
 
                 const gemini_message_type_t type = gemini_message_classify(json, len);
                 const bool protocol_handled = gemini_protocol_process_message(json, len);
                 const bool audio_handled = gemini_audio_process_server_message(json, len);
                 const bool handled = protocol_handled || audio_handled;
+
+                const int64_t process_elapsed_us = esp_timer_get_time() - process_start_us;
+                ++process_count;
+
+                if (process_elapsed_us >= RX_PROCESS_WARN_US) {
+                    ESP_LOGW(TAG,
+                             "RX process lambat: %lld ms, payload=%uB free=%u ready=%u",
+                             (long long)(process_elapsed_us / 1000),
+                             (unsigned)len,
+                             (unsigned)uxQueueMessagesWaiting(s_rx_free_queue),
+                             (unsigned)uxQueueMessagesWaiting(s_rx_ready_queue));
+                }
+
+                if ((process_count % RX_DIAGNOSTIC_EVERY) == 0) {
+                    const UBaseType_t free_count = uxQueueMessagesWaiting(s_rx_free_queue);
+                    const UBaseType_t ready_count = uxQueueMessagesWaiting(s_rx_ready_queue);
+                    const UBaseType_t stack_free = uxTaskGetStackHighWaterMark(nullptr);
+                    ESP_LOGI(TAG,
+                             "RX DIAG: count=%u process=%lldms payload=%uB free=%u/%u ready=%u/%u stack_free=%u",
+                             (unsigned)process_count,
+                             (long long)(process_elapsed_us / 1000),
+                             (unsigned)len,
+                             (unsigned)free_count,
+                             (unsigned)RX_BUFFER_COUNT,
+                             (unsigned)ready_count,
+                             (unsigned)RX_BUFFER_COUNT,
+                             (unsigned)stack_free);
+                }
 
                 if (type == GEMINI_MESSAGE_SETUP) {
                     s_gemini_ready = true;
