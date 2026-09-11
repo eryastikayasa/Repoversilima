@@ -14,6 +14,8 @@
 
 static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
+static volatile int64_t s_last_activity_us = 0;
+static volatile bool s_rx_processing = false;
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static constexpr size_t RX_BUFFER_COUNT = 10;
@@ -64,6 +66,7 @@ static bool ensure_rx_worker(void)
                 if (xQueueReceive(s_rx_ready_queue, &json, portMAX_DELAY) != pdPASS) continue;
                 if (!json) continue;
 
+                s_rx_processing = true;
                 const size_t len = strlen(json);
                 const int64_t start_us = esp_timer_get_time();
                 const gemini_message_type_t type = gemini_message_classify(json, len);
@@ -89,6 +92,7 @@ static bool ensure_rx_worker(void)
                 }
 
                 while (xQueueSend(s_rx_free_queue, &json, RX_BACKPRESSURE_WAIT) != pdPASS) {}
+                s_rx_processing = false;
             }
         }, "ws_rx", RX_WORKER_STACK, nullptr, RX_WORKER_PRIORITY, &s_rx_worker_task);
 
@@ -138,6 +142,8 @@ static void handle_data_event(esp_websocket_event_data_t *data)
         reset_rx();
         return;
     }
+
+    s_last_activity_us = esp_timer_get_time();
 
     if (offset == 0) {
         reset_rx();
@@ -202,6 +208,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             s_gemini_ready = false;
+            s_last_activity_us = esp_timer_get_time();
             reset_rx();
             if (!s_rx_worker_ready) break;
             if (xTaskCreate(send_gemini_setup_task, "ws_setup", SETUP_TASK_STACK, nullptr, SETUP_TASK_PRIORITY, nullptr) != pdPASS)
@@ -221,3 +228,17 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t 
 }
 
 bool websocket_event_gemini_ready(void) { return s_gemini_ready; }
+void websocket_event_note_activity(void) { s_last_activity_us = esp_timer_get_time(); }
+int64_t websocket_event_last_activity_us(void) { return s_last_activity_us; }
+
+bool websocket_event_drain(void)
+{
+    if (!s_rx_worker_ready) return true;
+    const int64_t deadline = esp_timer_get_time() + 15000000LL;
+    while (esp_timer_get_time() < deadline) {
+        if (uxQueueMessagesWaiting(s_rx_ready_queue) == 0 && !s_rx_processing && !s_rx_assembling) return true;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGE(TAG, "RX drain timeout: ready=%u processing=%d assembling=%d", (unsigned)uxQueueMessagesWaiting(s_rx_ready_queue), (int)s_rx_processing, (int)s_rx_assembling);
+    return false;
+}
