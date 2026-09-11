@@ -25,6 +25,8 @@ static constexpr uint32_t RX_WORKER_STACK = 8192;
 static constexpr UBaseType_t RX_WORKER_PRIORITY = 5;
 static constexpr uint32_t RX_DIAGNOSTIC_EVERY = 10;
 static constexpr int64_t RX_PROCESS_WARN_US = 50000;
+static constexpr uint32_t SETUP_TASK_STACK = 4096;
+static constexpr UBaseType_t SETUP_TASK_PRIORITY = 5;
 
 static QueueHandle_t s_rx_free_queue = nullptr;
 static QueueHandle_t s_rx_ready_queue = nullptr;
@@ -162,6 +164,11 @@ static bool ensure_rx_worker(void)
     return true;
 }
 
+bool websocket_event_init(void)
+{
+    return ensure_rx_worker();
+}
+
 static void reset_rx(void)
 {
     if (s_rx_assembling_buffer) {
@@ -197,7 +204,7 @@ static void handle_data_event(esp_websocket_event_data_t *data)
         return;
     }
 
-    if (!ensure_rx_worker()) {
+    if (!s_rx_worker_ready || !s_rx_free_queue || !s_rx_ready_queue) {
         ESP_LOGE(TAG, "RX worker belum siap; payload dibuang");
         reset_rx();
         return;
@@ -267,6 +274,13 @@ static void send_gemini_setup(void)
     free(setup);
 }
 
+static void send_gemini_setup_task(void *arg)
+{
+    (void)arg;
+    send_gemini_setup();
+    vTaskDelete(nullptr);
+}
+
 void websocket_event_handler(void *handler_args,
                              esp_event_base_t base,
                              int32_t event_id,
@@ -281,8 +295,20 @@ void websocket_event_handler(void *handler_args,
         case WEBSOCKET_EVENT_CONNECTED:
             s_gemini_ready = false;
             reset_rx();
-            ensure_rx_worker();
-            send_gemini_setup();
+
+            if (!s_rx_worker_ready) {
+                ESP_LOGE(TAG, "RX worker tidak siap saat WebSocket CONNECTED");
+                break;
+            }
+
+            if (xTaskCreate(send_gemini_setup_task,
+                            "ws_setup",
+                            SETUP_TASK_STACK,
+                            nullptr,
+                            SETUP_TASK_PRIORITY,
+                            nullptr) != pdPASS) {
+                ESP_LOGE(TAG, "Gagal membuat task Gemini setup");
+            }
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
