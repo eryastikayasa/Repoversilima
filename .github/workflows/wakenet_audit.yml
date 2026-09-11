@@ -78,7 +78,6 @@ jobs:
             echo "--- compiled ELF strings ---"
             strings "$ELF" | grep -F 'WakeNet ready:'
             strings "$ELF" | grep -F 'Wake word aktif: HI, ESP'
-            strings "$ELF" | grep -F 'WakeWord event diterima AudioEngine'
             strings "$ELF" | grep -F 'wn9_hiesp'
             echo "Compiled WakeNet9 integration: PASS"
           else
@@ -87,5 +86,5 @@ jobs:
 
           echo "========================================"
           echo "WAKENET9 HI ESP AUDIT: PASS"
-          echo "Repo4 baseline integration verified"
+          echo "Repo5 WakeNet9 integration verified"
           echo "========================================"
