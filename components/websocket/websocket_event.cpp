@@ -15,11 +15,11 @@ static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
 
 // Gemini Live responses can be larger than the WebSocket client's internal
-// event chunks. Keep complete-message storage in PSRAM so the event callback
+// event chunks. Complete-message storage lives in PSRAM so the event callback
 // does not consume a large DRAM/static buffer.
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
-static constexpr size_t RX_BUFFER_COUNT = 3;
+static constexpr size_t RX_BUFFER_COUNT = 6;
 static constexpr uint32_t RX_WORKER_STACK = 8192;
 static constexpr UBaseType_t RX_WORKER_PRIORITY = 5;
 
@@ -85,32 +85,32 @@ static bool ensure_rx_worker(void)
                     continue;
                 }
 
-                if (json) {
-                    const size_t len = strlen(json);
-                    ESP_LOGI(TAG, "Gemini RX worker process: %u byte", (unsigned)len);
+                if (!json) continue;
 
-                    const gemini_message_type_t type = gemini_message_classify(json, len);
-                    const bool protocol_handled = gemini_protocol_process_message(json, len);
-                    const bool audio_handled = gemini_audio_process_server_message(json, len);
-                    const bool handled = protocol_handled || audio_handled;
+                const size_t len = strlen(json);
+                ESP_LOGI(TAG, "Gemini RX worker process: %u byte", (unsigned)len);
 
-                    if (type == GEMINI_MESSAGE_SETUP) {
-                        s_gemini_ready = true;
-                        ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+                const gemini_message_type_t type = gemini_message_classify(json, len);
+                const bool protocol_handled = gemini_protocol_process_message(json, len);
+                const bool audio_handled = gemini_audio_process_server_message(json, len);
+                const bool handled = protocol_handled || audio_handled;
+
+                if (type == GEMINI_MESSAGE_SETUP) {
+                    s_gemini_ready = true;
+                    ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+                }
+
+                if (!handled) {
+                    const size_t log_len = len < RX_DIAGNOSTIC_MAX ? len : RX_DIAGNOSTIC_MAX;
+                    ESP_LOGW(TAG, "Gemini RX belum dipetakan (%u byte)", (unsigned)len);
+                    ESP_LOGW(TAG, "Gemini RX RAW: %.*s", (int)log_len, json);
+                    if (len > RX_DIAGNOSTIC_MAX) {
+                        ESP_LOGW(TAG, "Gemini RX RAW dipotong pada %u byte", (unsigned)RX_DIAGNOSTIC_MAX);
                     }
+                }
 
-                    if (!handled) {
-                        const size_t log_len = len < RX_DIAGNOSTIC_MAX ? len : RX_DIAGNOSTIC_MAX;
-                        ESP_LOGW(TAG, "Gemini RX belum dipetakan (%u byte)", (unsigned)len);
-                        ESP_LOGW(TAG, "Gemini RX RAW: %.*s", (int)log_len, json);
-                        if (len > RX_DIAGNOSTIC_MAX) {
-                            ESP_LOGW(TAG, "Gemini RX RAW dipotong pada %u byte", (unsigned)RX_DIAGNOSTIC_MAX);
-                        }
-                    }
-
-                    if (xQueueSend(s_rx_free_queue, &json, portMAX_DELAY) != pdPASS) {
-                        ESP_LOGE(TAG, "Gagal mengembalikan RX buffer ke free queue");
-                    }
+                if (xQueueSend(s_rx_free_queue, &json, portMAX_DELAY) != pdPASS) {
+                    ESP_LOGE(TAG, "Gagal mengembalikan RX buffer ke free queue");
                 }
             }
         },
@@ -153,13 +153,6 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     const size_t payload_len = (size_t)data->payload_len;
     const size_t offset = (size_t)data->payload_offset;
     const size_t chunk_len = (size_t)data->data_len;
-
-    ESP_LOGI(TAG,
-             "Gemini RX chunk: opcode=0x%02X offset=%u len=%u total=%u",
-             data->op_code,
-             (unsigned)offset,
-             (unsigned)chunk_len,
-             (unsigned)payload_len);
 
     if (payload_len > RX_MAX_PAYLOAD ||
         offset > payload_len ||
@@ -204,9 +197,7 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     memcpy(s_rx_assembling_buffer + offset, data->data_ptr, chunk_len);
     s_rx_received += chunk_len;
 
-    if (s_rx_received != s_rx_expected) {
-        return;
-    }
+    if (s_rx_received != s_rx_expected) return;
 
     s_rx_assembling_buffer[s_rx_expected] = '\0';
     char *ready_buffer = s_rx_assembling_buffer;
