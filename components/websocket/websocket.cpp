@@ -1,9 +1,19 @@
 #include "websocket.h"
 #include "websocket_transport.h"
+#include "websocket_event.h"
 
 esp_err_t websocket_init(void)
 {
-    return websocket_transport_init();
+    const esp_err_t err = websocket_transport_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!websocket_event_init()) {
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t websocket_connect(void)
