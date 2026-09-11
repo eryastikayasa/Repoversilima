@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_private/esp_clk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -92,7 +93,7 @@ static void log_tx_diagnostic(uint32_t sent_count, int64_t send_elapsed_us)
 
     const UBaseType_t queued = uxQueueMessagesWaiting(s_tx_queue);
     const UBaseType_t free_stack = uxTaskGetStackHighWaterMark(nullptr);
-    const uint32_t cpu_hz = esp_clk_cpu_freq();
+    const uint32_t cpu_hz = (uint32_t)esp_clk_cpu_freq();
     const size_t free_heap = esp_get_free_heap_size();
     const size_t min_heap = esp_get_minimum_free_heap_size();
 
@@ -153,9 +154,6 @@ static void websocket_audio_tx_task(void *)
         }
     }
 
-    // The capture task may still be unwinding from a 100 ms AudioEngine read.
-    // Wait for it to finish before flushing, so it can never enqueue a new
-    // heap-backed message after the final queue cleanup.
     const TickType_t wait_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
     while (s_capture_task != nullptr &&
            (int32_t)(xTaskGetTickCount() - wait_deadline) < 0) {
@@ -193,7 +191,6 @@ static void websocket_audio_capture_task(void *)
             continue;
         }
 
-        // Stop may have happened while AudioEngine was waiting for a frame.
         if (!s_running) {
             break;
         }
@@ -215,8 +212,6 @@ static void websocket_audio_capture_task(void *)
             continue;
         }
 
-        // Re-check after Base64/JSON construction because stop may have been
-        // requested while this CPU-heavy operation was running.
         if (!s_running) {
             free(json);
             break;
@@ -242,8 +237,6 @@ bool websocket_audio_start(void)
         return false;
     }
 
-    // A previous stop is asynchronous. Do not create a second pair of tasks
-    // while the previous pair is still unwinding.
     const TickType_t wait_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
     while ((s_capture_task != nullptr || s_tx_task != nullptr) &&
            (int32_t)(xTaskGetTickCount() - wait_deadline) < 0) {
