@@ -61,7 +61,9 @@ static bool process_gemini_tool_call(const char *json,size_t len)
     if(!cJSON_IsArray(calls)){cJSON_Delete(root);return false;}
     bool handled=false;cJSON *fc=nullptr;cJSON_ArrayForEach(fc,calls){if(!cJSON_IsObject(fc))continue;cJSON *id=cJSON_GetObjectItem(fc,"id");cJSON *name=cJSON_GetObjectItem(fc,"name");cJSON *args=cJSON_GetObjectItem(fc,"args");
         if(!cJSON_IsString(id)||!id->valuestring||!cJSON_IsString(name)||!name->valuestring||!cJSON_IsObject(args))continue;
-        if(strcmp(name->valuestring,"control_device")!=0)continue;cJSON *command=cJSON_GetObjectItem(args,"command");if(!cJSON_IsString(command)||!command->valuestring)continue;
+        if(strcmp(name->valuestring,"control_device")!=0)continue;
+        cJSON *command=cJSON_GetObjectItem(args,"command");
+        if(!cJSON_IsString(command)||!command->valuestring)continue;
         ESP_LOGI(TAG,"Gemini TOOL: %s",command->valuestring);const bool success=uart_control_execute_command(command->valuestring);send_tool_response(id->valuestring,name->valuestring,success);handled=true;
     }
     cJSON_Delete(root);return handled;
@@ -69,7 +71,8 @@ static bool process_gemini_tool_call(const char *json,size_t len)
 
 static bool ensure_rx_worker(void)
 {
-    if(s_rx_worker_ready)return true;s_rx_free_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_free_storage),&s_rx_free_queue_storage);s_rx_ready_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_ready_storage),&s_rx_ready_queue_storage);if(!s_rx_free_queue||!s_rx_ready_queue)return false;
+    if(s_rx_worker_ready)return true;
+    s_rx_free_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_free_storage),&s_rx_free_queue_storage);s_rx_ready_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_ready_storage),&s_rx_ready_queue_storage);if(!s_rx_free_queue||!s_rx_ready_queue)return false;
     for(size_t i=0;i<RX_BUFFER_COUNT;++i){s_rx_buffers[i]=static_cast<char *>(heap_caps_malloc(RX_MAX_PAYLOAD+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(!s_rx_buffers[i]){ESP_LOGE(TAG,"Gagal alokasi RX buffer PSRAM #%u",(unsigned)i);return false;}if(xQueueSend(s_rx_free_queue,&s_rx_buffers[i],0)!=pdPASS)return false;}
     BaseType_t result=xTaskCreate([](void *){ESP_LOGI(TAG,"Gemini RX worker START: %u x %uKB PSRAM",(unsigned)RX_BUFFER_COUNT,(unsigned)(RX_MAX_PAYLOAD/1024));uint32_t process_count=0;while(true){char *json=nullptr;if(xQueueReceive(s_rx_ready_queue,&json,portMAX_DELAY)!=pdPASS)continue;if(!json)continue;s_rx_processing=true;const size_t len=strlen(json);const int64_t start_us=esp_timer_get_time();const gemini_message_type_t type=gemini_message_classify(json,len);const bool protocol_handled=gemini_protocol_process_message(json,len);const bool tool_handled=(type==GEMINI_MESSAGE_TOOL)&&process_gemini_tool_call(json,len);const bool audio_handled=gemini_audio_process_server_message(json,len);const bool handled=protocol_handled||tool_handled||audio_handled;const int64_t elapsed_us=esp_timer_get_time()-start_us;++process_count;
         if(elapsed_us>=RX_PROCESS_WARN_US)ESP_LOGW(TAG,"RX process lambat: %lld ms payload=%uB free=%u ready=%u",(long long)(elapsed_us/1000),(unsigned)len,(unsigned)uxQueueMessagesWaiting(s_rx_free_queue),(unsigned)uxQueueMessagesWaiting(s_rx_ready_queue));
