@@ -21,6 +21,8 @@ static EventGroupHandle_t s_wifi_event_group = NULL;
 
 static volatile bool s_wifi_started = false;
 static volatile bool s_wifi_got_ip = false;
+static volatile uint32_t s_wifi_disconnect_count = 0;
+static volatile uint8_t s_wifi_last_disconnect_reason = 0;
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -72,8 +74,24 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         s_wifi_got_ip = false;
+        ++s_wifi_disconnect_count;
+
+        if (event_data) {
+            const wifi_event_sta_disconnected_t *event =
+                static_cast<const wifi_event_sta_disconnected_t *>(event_data);
+            s_wifi_last_disconnect_reason = event->reason;
+            ESP_LOGW(TAG,
+                     "Wi-Fi TERPUTUS: reason=%u disconnect_count=%u",
+                     (unsigned)event->reason,
+                     (unsigned)s_wifi_disconnect_count);
+        } else {
+            s_wifi_last_disconnect_reason = 0;
+            ESP_LOGW(TAG,
+                     "Wi-Fi TERPUTUS: reason=unknown disconnect_count=%u",
+                     (unsigned)s_wifi_disconnect_count);
+        }
+
         if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGW(TAG, "Wi-Fi TERPUTUS");
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) ESP_LOGW(TAG, "Reconnect Wi-Fi gagal: %s", esp_err_to_name(err));
         return;
@@ -97,6 +115,8 @@ void wifi_init_sta(void)
 
     s_wifi_started = false;
     s_wifi_got_ip = false;
+    s_wifi_disconnect_count = 0;
+    s_wifi_last_disconnect_reason = 0;
 
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -212,19 +232,41 @@ void wifi_log_diagnostic(void)
     }
 
     wifi_ap_record_t ap = {};
-    const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Wi-Fi DIAG: link=NO_AP err=%s got_ip=%u",
-                 esp_err_to_name(err),
-                 s_wifi_got_ip ? 1U : 0U);
+    const esp_err_t ap_err = esp_wifi_sta_get_ap_info(&ap);
+    if (ap_err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Wi-Fi DIAG: link=NO_AP err=%s got_ip=%u disconnects=%u last_reason=%u",
+                 esp_err_to_name(ap_err),
+                 s_wifi_got_ip ? 1U : 0U,
+                 (unsigned)s_wifi_disconnect_count,
+                 (unsigned)s_wifi_last_disconnect_reason);
         return;
     }
 
+    wifi_phy_mode_t phymode = WIFI_PHY_MODE_NONE;
+    const esp_err_t phy_err = esp_wifi_sta_get_negotiated_phymode(&phymode);
+
+    wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+    const esp_err_t ps_err = esp_wifi_get_ps(&ps);
+
+    int8_t tx_power = 0;
+    const esp_err_t tx_power_err = esp_wifi_get_max_tx_power(&tx_power);
+
     ESP_LOGI(TAG,
-             "Wi-Fi DIAG: rssi=%d dBm channel=%u phy=%u bw=%u got_ip=%u",
+             "Wi-Fi DIAG: rssi=%d dBm channel=%u second=%u bandwidth=%u phy=%d got_ip=%u disconnects=%u last_reason=%u ps=%d txpwr=%d",
              (int)ap.rssi,
              (unsigned)ap.primary,
-             (unsigned)ap.phy_11b,
              (unsigned)ap.second,
-             s_wifi_got_ip ? 1U : 0U);
+             (unsigned)ap.bandwidth,
+             phy_err == ESP_OK ? (int)phymode : -1,
+             s_wifi_got_ip ? 1U : 0U,
+             (unsigned)s_wifi_disconnect_count,
+             (unsigned)s_wifi_last_disconnect_reason,
+             ps_err == ESP_OK ? (int)ps : -1,
+             tx_power_err == ESP_OK ? (int)tx_power : -1);
+
+    ESP_LOGI(TAG,
+             "Wi-Fi DIAG: bssid=%02X:%02X:%02X:%02X:%02X:%02X",
+             ap.bssid[0], ap.bssid[1], ap.bssid[2],
+             ap.bssid[3], ap.bssid[4], ap.bssid[5]);
 }
