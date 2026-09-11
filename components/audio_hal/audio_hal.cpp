@@ -7,7 +7,6 @@
 
 static const char *TAG = "AUDIO_HAL";
 
-// Proven Repo4 hardware mapping.
 static constexpr gpio_num_t MIC_I2S_SCK = GPIO_NUM_5;
 static constexpr gpio_num_t MIC_I2S_WS  = GPIO_NUM_4;
 static constexpr gpio_num_t MIC_I2S_SD  = GPIO_NUM_6;
@@ -38,14 +37,12 @@ void audio_hal_init(void)
 
     ESP_LOGI(TAG, "Audio HAL init: MIC=16k PCM16, SPK=24k PCM16");
 
-    // TX: MAX98357A
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     tx_chan_cfg.dma_desc_num = 6;
     tx_chan_cfg.dma_frame_num = 240;
     tx_chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&tx_chan_cfg, &s_tx, nullptr));
 
-    // RX: INMP441
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
     rx_chan_cfg.dma_desc_num = 6;
     rx_chan_cfg.dma_frame_num = 240;
@@ -114,21 +111,15 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
     if (!s_capture_started || !s_rx) return ESP_ERR_INVALID_STATE;
     if (samples > 1024) return ESP_ERR_INVALID_SIZE;
 
-    // INMP441 arrives as 32-bit samples. Keep conversion here, at the HAL
-    // boundary, so every upper layer receives only signed PCM16 mono.
     size_t bytes_read = 0;
     const size_t input_bytes = samples * sizeof(int32_t);
 
-    // Match the proven Repo4 capture behavior: wait for the I2S DMA frame
-    // instead of turning normal capture latency into ESP_ERR_TIMEOUT.
     esp_err_t err = i2s_channel_read(
         s_rx, s_rx_raw, input_bytes, &bytes_read, portMAX_DELAY);
     if (err != ESP_OK) return err;
 
     const size_t count = bytes_read / sizeof(int32_t);
     for (size_t i = 0; i < count; ++i) {
-        // INMP441/Repo4 proven path uses the high 16 bits of the 32-bit I2S
-        // sample as the internal PCM16 representation.
         buffer[i] = (int16_t)(s_rx_raw[i] >> 16);
     }
     *samples_read = count;
@@ -170,13 +161,37 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
 
     // Speaker I2S is configured as 32-bit. Expand PCM16 to the 32-bit
     // left-justified representation used by the proven Repo4 path.
-    for (size_t i = 0; i < samples; ++i)
+    for (size_t i = 0; i < samples; ++i) {
         s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
+    }
 
-    size_t bytes_written = 0;
-    esp_err_t err = i2s_channel_write(
-        s_tx, s_tx_raw, samples * sizeof(int32_t), &bytes_written, pdMS_TO_TICKS(100));
+    // The I2S driver can return a partial write when the DMA ring becomes
+    // available only in smaller pieces. Do not drop the unwritten PCM.
+    size_t total_written = 0;
+    while (total_written < samples) {
+        size_t bytes_written = 0;
+        const size_t remaining_bytes = (samples - total_written) * sizeof(int32_t);
+        const esp_err_t err = i2s_channel_write(
+            s_tx,
+            s_tx_raw + total_written,
+            remaining_bytes,
+            &bytes_written,
+            pdMS_TO_TICKS(100));
 
-    *samples_written = bytes_written / sizeof(int32_t);
-    return err;
+        const size_t chunk_written = bytes_written / sizeof(int32_t);
+        total_written += chunk_written;
+
+        if (err != ESP_OK) {
+            *samples_written = total_written;
+            return err;
+        }
+
+        if (chunk_written == 0) {
+            *samples_written = total_written;
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    *samples_written = total_written;
+    return ESP_OK;
 }
