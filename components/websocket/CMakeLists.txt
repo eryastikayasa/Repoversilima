@@ -17,4 +17,5 @@ idf_component_register(
         mbedtls
         web_config
         audio_engine
+        wifi_manager
 )
