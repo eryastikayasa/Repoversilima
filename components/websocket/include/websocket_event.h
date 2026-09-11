@@ -2,6 +2,7 @@
 
 #include "esp_websocket_client.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +16,9 @@ void websocket_event_handler(void *handler_args,
                              void *event_data);
 
 bool websocket_event_gemini_ready(void);
+void websocket_event_note_activity(void);
+int64_t websocket_event_last_activity_us(void);
+bool websocket_event_drain(void);
 
 #ifdef __cplusplus
 }
