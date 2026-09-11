@@ -19,5 +19,5 @@ idf_component_register(
         audio_engine
         wifi_manager
         uart_control
-        display_face
+        display
 )
