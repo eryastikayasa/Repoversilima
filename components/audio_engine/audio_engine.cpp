@@ -29,6 +29,11 @@ static constexpr size_t PLAYBACK_BLOCK_BYTES = PLAYBACK_BLOCK_SAMPLES * sizeof(i
 static constexpr size_t PLAYBACK_QUEUE_DEPTH = 12;
 static constexpr uint32_t PLAYBACK_TASK_STACK = 4096;
 
+struct PlaybackBlock {
+    uint16_t samples;
+    int16_t pcm[PLAYBACK_BLOCK_SAMPLES];
+};
+
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
 static TaskHandle_t s_wakeword_task = nullptr;
 static bool s_initialized = false;
@@ -44,9 +49,9 @@ static QueueHandle_t s_mic_queue = nullptr;
 static TaskHandle_t s_playback_task = nullptr;
 static volatile bool s_playback_running = false;
 static StaticQueue_t s_playback_queue_storage;
-static uint8_t s_playback_queue_buffer[PLAYBACK_QUEUE_DEPTH][PLAYBACK_BLOCK_BYTES];
+static PlaybackBlock s_playback_queue_buffer[PLAYBACK_QUEUE_DEPTH];
 static QueueHandle_t s_playback_queue = nullptr;
-static uint8_t s_playback_enqueue_block[PLAYBACK_BLOCK_BYTES];
+static PlaybackBlock s_playback_enqueue_block;
 
 static void wakeword_task(void *)
 {
@@ -134,7 +139,7 @@ static void conversation_task(void *)
 
 static void playback_task(void *)
 {
-    static int16_t playback_buffer[PLAYBACK_BLOCK_SAMPLES];
+    static PlaybackBlock playback_block;
 
     ESP_LOGI(TAG,
              "Speaker playback task START: 24kHz PCM16, block=%u samples, queue=%u",
@@ -143,23 +148,31 @@ static void playback_task(void *)
 
     while (s_playback_running) {
         if (xQueueReceive(s_playback_queue,
-                          playback_buffer,
+                          &playback_block,
                           pdMS_TO_TICKS(20)) != pdTRUE) {
             continue;
         }
 
         if (!s_playback_running) break;
 
+        if (playback_block.samples == 0 ||
+            playback_block.samples > PLAYBACK_BLOCK_SAMPLES) {
+            ESP_LOGW(TAG,
+                     "Speaker playback block invalid: samples=%u",
+                     (unsigned)playback_block.samples);
+            continue;
+        }
+
         size_t samples_written = 0;
         const esp_err_t err = audio_hal_write_pcm(
-            playback_buffer,
-            PLAYBACK_BLOCK_SAMPLES,
+            playback_block.pcm,
+            playback_block.samples,
             &samples_written);
 
-        if (err != ESP_OK || samples_written != PLAYBACK_BLOCK_SAMPLES) {
+        if (err != ESP_OK || samples_written != playback_block.samples) {
             ESP_LOGW(TAG,
                      "Speaker PCM write tidak lengkap: requested=%u written=%u err=%s",
-                     (unsigned)PLAYBACK_BLOCK_SAMPLES,
+                     (unsigned)playback_block.samples,
                      (unsigned)samples_written,
                      esp_err_to_name(err));
         }
@@ -223,8 +236,8 @@ extern "C" bool audio_engine_init(void)
 
     s_playback_queue = xQueueCreateStatic(
         PLAYBACK_QUEUE_DEPTH,
-        PLAYBACK_BLOCK_BYTES,
-        &s_playback_queue_buffer[0][0],
+        sizeof(PlaybackBlock),
+        reinterpret_cast<uint8_t *>(s_playback_queue_buffer),
         &s_playback_queue_storage);
     if (!s_playback_queue) {
         ESP_LOGE(TAG, "Gagal membuat speaker playback queue");
@@ -472,8 +485,6 @@ extern "C" bool audio_engine_write_speaker_pcm(
     size_t samples,
     uint32_t timeout_ms)
 {
-    (void)timeout_ms;
-
     if (!buffer || samples == 0 || !s_playback_running || !s_playback_queue) {
         return false;
     }
@@ -484,20 +495,18 @@ extern "C" bool audio_engine_write_speaker_pcm(
                            ? PLAYBACK_BLOCK_SAMPLES
                            : (samples - offset);
 
-        // Static storage keeps the 2 KB queue element off the WebSocket/event
-        // task stack. The current WebSocket event path is serialized.
-        memcpy(s_playback_enqueue_block,
+        s_playback_enqueue_block.samples = static_cast<uint16_t>(chunk);
+        memcpy(s_playback_enqueue_block.pcm,
                buffer + offset,
                chunk * sizeof(int16_t));
 
-        if (chunk < PLAYBACK_BLOCK_SAMPLES) {
-            memset(s_playback_enqueue_block + chunk * sizeof(int16_t),
-                   0,
-                   PLAYBACK_BLOCK_BYTES - chunk * sizeof(int16_t));
-        }
-
-        if (xQueueSend(s_playback_queue, s_playback_enqueue_block, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Speaker playback queue penuh; PCM chunk drop");
+        if (xQueueSend(s_playback_queue,
+                       &s_playback_enqueue_block,
+                       pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            ESP_LOGW(TAG,
+                     "Speaker playback queue penuh setelah wait %ums; chunk drop samples=%u",
+                     (unsigned)timeout_ms,
+                     (unsigned)chunk);
             return false;
         }
 
