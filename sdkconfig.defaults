@@ -16,3 +16,8 @@ CONFIG_SR_NSN_NSNET2=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# WebSocket full-duplex: keep TX serialization independent from RX/control lock.
+# This avoids send-side network backpressure blocking WebSocket receive handling.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=5000
