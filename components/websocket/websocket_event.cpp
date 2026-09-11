@@ -16,6 +16,7 @@ static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
 static volatile int64_t s_last_activity_us = 0;
 static volatile bool s_rx_processing = false;
+static bool s_greeting_sent = false;
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static constexpr size_t RX_BUFFER_COUNT = 10;
@@ -84,6 +85,22 @@ static bool ensure_rx_worker(void)
                 if (type == GEMINI_MESSAGE_SETUP) {
                     s_gemini_ready = true;
                     ESP_LOGI(TAG, "Gemini setupComplete - audio uplink READY");
+                    if (!s_greeting_sent && websocket_transport_is_connected()) {
+                        char *greeting = nullptr;
+                        size_t greeting_len = 0;
+                        if (gemini_protocol_build_realtime_text("halo ", &greeting, &greeting_len)) {
+                            const esp_err_t err = websocket_transport_send_text(greeting, greeting_len);
+                            if (err == ESP_OK) {
+                                s_greeting_sent = true;
+                                ESP_LOGI(TAG, "Gemini greeting trigger terkirim");
+                            } else {
+                                ESP_LOGE(TAG, "Gagal mengirim Gemini greeting trigger: %s", esp_err_to_name(err));
+                            }
+                            free(greeting);
+                        } else {
+                            ESP_LOGE(TAG, "Gagal membuat Gemini greeting trigger");
+                        }
+                    }
                 }
                 if (!handled) {
                     const size_t log_len = len < RX_DIAGNOSTIC_MAX ? len : RX_DIAGNOSTIC_MAX;
@@ -208,6 +225,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             s_gemini_ready = false;
+            s_greeting_sent = false;
             s_last_activity_us = esp_timer_get_time();
             reset_rx();
             if (!s_rx_worker_ready) break;
@@ -217,6 +235,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t 
         case WEBSOCKET_EVENT_DISCONNECTED:
         case WEBSOCKET_EVENT_ERROR:
             s_gemini_ready = false;
+            s_greeting_sent = false;
             reset_rx();
             break;
         case WEBSOCKET_EVENT_DATA:
