@@ -9,6 +9,7 @@ extern "C" {
 bool websocket_audio_start(void);
 void websocket_audio_stop(void);
 bool websocket_audio_running(void);
+bool websocket_audio_drain_stop(void);
 
 #ifdef __cplusplus
 }
