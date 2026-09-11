@@ -5,6 +5,8 @@
 #include "audio_engine.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -29,6 +31,7 @@ static constexpr uint32_t TX_TASK_STACK = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
 static constexpr int64_t SEND_WARN_US = 80000;
 static constexpr uint32_t STOP_WAIT_MS = 300;
+static constexpr uint32_t TX_DIAGNOSTIC_EVERY = 10;
 
 struct TxMessage {
     char *json;
@@ -83,11 +86,35 @@ static bool tx_queue_push(char *json, size_t json_len)
     return true;
 }
 
+static void log_tx_diagnostic(uint32_t sent_count, int64_t send_elapsed_us)
+{
+    if (!s_tx_queue || (sent_count % TX_DIAGNOSTIC_EVERY) != 0) return;
+
+    const UBaseType_t queued = uxQueueMessagesWaiting(s_tx_queue);
+    const UBaseType_t free_stack = uxTaskGetStackHighWaterMark(nullptr);
+    const uint32_t cpu_hz = esp_clk_cpu_freq();
+    const size_t free_heap = esp_get_free_heap_size();
+    const size_t min_heap = esp_get_minimum_free_heap_size();
+
+    ESP_LOGI(TAG,
+             "TX DIAG: count=%u send=%lldms queue=%u/%u stack_free=%u heap=%u minheap=%u cpu=%uMHz",
+             (unsigned)sent_count,
+             (long long)(send_elapsed_us / 1000),
+             (unsigned)queued,
+             (unsigned)TX_QUEUE_DEPTH,
+             (unsigned)free_stack,
+             (unsigned)free_heap,
+             (unsigned)min_heap,
+             (unsigned)(cpu_hz / 1000000U));
+}
+
 static void websocket_audio_tx_task(void *)
 {
     ESP_LOGI(TAG, "Audio TX sender START: queue=%u messages (~%ums)",
              (unsigned)TX_QUEUE_DEPTH,
              (unsigned)(TX_QUEUE_DEPTH * FRAMES_PER_MESSAGE * 20));
+
+    uint32_t sent_count = 0;
 
     while (s_running) {
         TxMessage message{};
@@ -110,12 +137,15 @@ static void websocket_audio_tx_task(void *)
         const int64_t send_elapsed_us = esp_timer_get_time() - send_start_us;
         const size_t message_len = message.len;
         free(message.json);
+        ++sent_count;
 
         if (send_elapsed_us >= SEND_WARN_US) {
             ESP_LOGW(TAG, "Audio TX send lambat: %lld ms, json=%uB",
                      (long long)(send_elapsed_us / 1000),
                      (unsigned)message_len);
         }
+
+        log_tx_diagnostic(sent_count, send_elapsed_us);
 
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Audio TX gagal: %s", esp_err_to_name(err));
