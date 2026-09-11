@@ -3,6 +3,7 @@
 #include "web_config.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -14,6 +15,7 @@ static bool s_initialized = false;
 
 static constexpr size_t API_KEY_MAX = 128;
 static constexpr size_t URL_MAX = 512;
+static constexpr int64_t SEND_WARN_US = 80000;
 
 static bool build_server_url(char *url, size_t url_size)
 {
@@ -131,10 +133,29 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
     if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
 
+    const int64_t start_us = esp_timer_get_time();
     const int sent = esp_websocket_client_send_text(
         s_client, text, (int)len, pdMS_TO_TICKS(5000));
+    const int64_t elapsed_us = esp_timer_get_time() - start_us;
 
-    return sent == (int)len ? ESP_OK : ESP_FAIL;
+    if (elapsed_us >= SEND_WARN_US) {
+        ESP_LOGW(TAG,
+                 "Transport TX lambat: %lld ms len=%u sent=%d",
+                 (long long)(elapsed_us / 1000),
+                 (unsigned)len,
+                 sent);
+    }
+
+    if (sent != (int)len) {
+        ESP_LOGW(TAG,
+                 "Transport TX hasil tidak lengkap: elapsed=%lldms requested=%u sent=%d",
+                 (long long)(elapsed_us / 1000),
+                 (unsigned)len,
+                 sent);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t websocket_transport_send_binary(const uint8_t *data, size_t len)
