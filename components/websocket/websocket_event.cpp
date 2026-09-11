@@ -20,7 +20,7 @@ static volatile bool s_gemini_ready = false;
 // does not consume a large DRAM/static buffer.
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
-static constexpr size_t RX_BUFFER_COUNT = 6;
+static constexpr size_t RX_BUFFER_COUNT = 10;
 static constexpr uint32_t RX_WORKER_STACK = 8192;
 static constexpr UBaseType_t RX_WORKER_PRIORITY = 5;
 static constexpr uint32_t RX_DIAGNOSTIC_EVERY = 10;
