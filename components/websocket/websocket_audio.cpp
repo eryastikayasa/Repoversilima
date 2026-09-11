@@ -20,7 +20,6 @@ static constexpr size_t TX_QUEUE_DEPTH = 40;
 static constexpr uint32_t BRIDGE_TASK_STACK = 4096;
 static constexpr uint32_t TX_TASK_STACK = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
-static constexpr int64_t SEND_WARN_US = 80000;
 static constexpr uint32_t STOP_WAIT_MS = 15000;
 static constexpr uint32_t SEND_RETRY_COUNT = 3;
 static constexpr uint32_t DISCONNECT_WAIT_MS = 10000;
@@ -69,11 +68,7 @@ static bool send_message_with_retry(TxMessage *message)
             if (disconnected_ms >= DISCONNECT_WAIT_MS) return false;
         }
         if (!(s_running || s_draining)) return false;
-        const int64_t start_us = esp_timer_get_time();
         const esp_err_t err = websocket_send_text(message->json, message->len);
-        const int64_t elapsed_us = esp_timer_get_time() - start_us;
-        if (elapsed_us >= SEND_WARN_US)
-            ESP_LOGW(TAG, "Audio TX lambat: %lld ms", (long long)(elapsed_us / 1000));
         if (err == ESP_OK) {
             websocket_event_note_activity();
             return true;
@@ -86,15 +81,11 @@ static bool send_message_with_retry(TxMessage *message)
 
 static void websocket_audio_tx_task(void *)
 {
-    ESP_LOGI(TAG, "Audio TX aktif");
     while (s_running || s_draining) {
         TxMessage message{};
         if (xQueueReceive(s_tx_queue, &message, pdMS_TO_TICKS(100)) != pdTRUE) continue;
         if (!message.json || message.len == 0) { free(message.json); continue; }
-        const int64_t queue_wait_us = esp_timer_get_time() - message.queued_at_us;
         const bool sent = send_message_with_retry(&message);
-        if (queue_wait_us >= SEND_WARN_US)
-            ESP_LOGW(TAG, "Audio TX antrean lambat: %lld ms", (long long)(queue_wait_us / 1000));
         if (!sent) {
             ESP_LOGE(TAG, "Audio TX fatal: message tidak terkirim; abort conversation audio");
             s_tx_fatal_error = true;
@@ -107,7 +98,6 @@ static void websocket_audio_tx_task(void *)
     }
     if (!s_draining) tx_queue_flush();
     s_tx_task = nullptr;
-    ESP_LOGI(TAG, "Audio TX berhenti");
     vTaskDelete(nullptr);
 }
 
@@ -144,7 +134,6 @@ static void websocket_audio_bridge_task(void *)
         frames_collected = 0;
     }
     s_bridge_task = nullptr;
-    ESP_LOGI(TAG, "Audio uplink berhenti");
     vTaskDelete(nullptr);
 }
 
