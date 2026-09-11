@@ -169,34 +169,50 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
         s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
     }
 
-    // The I2S driver may return ESP_ERR_TIMEOUT together with a partial
-    // write when the DMA ring only accepts the currently available portion.
-    // A timeout with progress is therefore not a failed PCM write: continue
-    // from the unwritten sample instead of dropping the remainder.
+    // The DMA configuration uses 240-sample frames. Keep each I2S write at
+    // one DMA frame, matching the proven Repo4 speaker path. This avoids
+    // relying on larger driver transfers while preserving partial-write
+    // continuation when the DMA ring accepts less than one frame.
+    constexpr size_t I2S_WRITE_SAMPLES = 240;
+    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
+
     size_t total_written = 0;
     while (total_written < samples) {
+        const size_t remaining = samples - total_written;
+        const size_t chunk = remaining > I2S_WRITE_SAMPLES
+                           ? I2S_WRITE_SAMPLES
+                           : remaining;
+
         size_t bytes_written = 0;
-        const size_t remaining_bytes = (samples - total_written) * sizeof(int32_t);
         const esp_err_t err = i2s_channel_write(
             s_tx,
             s_tx_raw + total_written,
-            remaining_bytes,
+            chunk * sizeof(int32_t),
             &bytes_written,
-            pdMS_TO_TICKS(100));
+            pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
 
-        const size_t chunk_written = bytes_written / sizeof(int32_t);
+        size_t chunk_written = bytes_written / sizeof(int32_t);
+        if (chunk_written > chunk) chunk_written = chunk;
         total_written += chunk_written;
 
-        if (chunk_written == 0) {
+        if (err != ESP_OK || chunk_written != chunk) {
             *samples_written = total_written;
-            return err == ESP_OK ? ESP_ERR_TIMEOUT : err;
-        }
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "I2S speaker write fail: err=%s written=%u/%u",
+                         esp_err_to_name(err),
+                         (unsigned)bytes_written,
+                         (unsigned)(chunk * sizeof(int32_t)));
+                vTaskDelay(pdMS_TO_TICKS(1));
+                return err;
+            }
 
-        // Partial progress followed by ESP_ERR_TIMEOUT is expected here.
-        // Keep draining the same PCM block until all samples are accepted.
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            *samples_written = total_written;
-            return err;
+            // No progress without an error is treated as a bounded failure.
+            ESP_LOGW(TAG,
+                     "I2S speaker write tidak lengkap: written=%u/%u",
+                     (unsigned)bytes_written,
+                     (unsigned)(chunk * sizeof(int32_t)));
+            return ESP_ERR_TIMEOUT;
         }
     }
 
