@@ -28,6 +28,7 @@ static constexpr uint32_t CAPTURE_TASK_STACK = 6144;
 static constexpr uint32_t TX_TASK_STACK = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
 static constexpr int64_t SEND_WARN_US = 80000;
+static constexpr uint32_t STOP_WAIT_MS = 300;
 
 struct TxMessage {
     char *json;
@@ -122,7 +123,15 @@ static void websocket_audio_tx_task(void *)
         }
     }
 
-    // Do not leave heap-backed messages behind when the conversation stops.
+    // The capture task may still be unwinding from a 100 ms AudioEngine read.
+    // Wait for it to finish before flushing, so it can never enqueue a new
+    // heap-backed message after the final queue cleanup.
+    const TickType_t wait_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
+    while (s_capture_task != nullptr &&
+           (int32_t)(xTaskGetTickCount() - wait_deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
     tx_queue_flush();
 
     s_tx_task = nullptr;
@@ -154,6 +163,11 @@ static void websocket_audio_capture_task(void *)
             continue;
         }
 
+        // Stop may have happened while AudioEngine was waiting for a frame.
+        if (!s_running) {
+            break;
+        }
+
         memcpy(&message_pcm[frames_collected * FRAME_SAMPLES],
                frame_pcm, FRAME_SAMPLES * sizeof(int16_t));
         frames_collected++;
@@ -169,6 +183,13 @@ static void websocket_audio_capture_task(void *)
             ESP_LOGE(TAG, "Gagal membuat realtime audio message");
             frames_collected = 0;
             continue;
+        }
+
+        // Re-check after Base64/JSON construction because stop may have been
+        // requested while this CPU-heavy operation was running.
+        if (!s_running) {
+            free(json);
+            break;
         }
 
         if (!tx_queue_push(json, json_len)) {
@@ -188,6 +209,19 @@ bool websocket_audio_start(void)
     if (s_running) return true;
     if (!audio_engine_conversation_active()) {
         ESP_LOGW(TAG, "Conversation AudioEngine belum aktif");
+        return false;
+    }
+
+    // A previous stop is asynchronous. Do not create a second pair of tasks
+    // while the previous pair is still unwinding.
+    const TickType_t wait_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
+    while ((s_capture_task != nullptr || s_tx_task != nullptr) &&
+           (int32_t)(xTaskGetTickCount() - wait_deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    if (s_capture_task != nullptr || s_tx_task != nullptr) {
+        ESP_LOGW(TAG, "Audio uplink task sebelumnya belum selesai");
         return false;
     }
 
