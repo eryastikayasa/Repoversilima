@@ -13,6 +13,9 @@ bool gemini_protocol_build_realtime_audio(const int16_t *pcm16,
                                           size_t samples,
                                           char **output,
                                           size_t *output_len);
+bool gemini_protocol_build_realtime_text(const char *text,
+                                         char **output,
+                                         size_t *output_len);
 bool gemini_protocol_process_message(const char *json, size_t len);
 
 #ifdef __cplusplus
