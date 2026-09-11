@@ -14,13 +14,13 @@
 
 static const char *TAG = "WS_AUDIO";
 
-// AudioEngine owns microphone capture and prepares fixed 20 ms frames:
-// 320 samples @ 16 kHz, PCM16 mono.
+// AudioEngine owns MIC and prepares 20 ms PCM16 frames (320 samples @ 16 kHz).
+// This file only bridges prepared AudioEngine frames to Gemini transport.
 static constexpr size_t FRAME_SAMPLES = 320;
 static constexpr size_t FRAMES_PER_MESSAGE = 5;
 static constexpr size_t MESSAGE_SAMPLES = FRAME_SAMPLES * FRAMES_PER_MESSAGE;
-static constexpr size_t TX_QUEUE_DEPTH = 6;
-static constexpr uint32_t CAPTURE_TASK_STACK = 4096;
+static constexpr size_t TX_QUEUE_DEPTH = 4;
+static constexpr uint32_t BRIDGE_TASK_STACK = 4096;
 static constexpr uint32_t TX_TASK_STACK = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
 static constexpr int64_t SEND_WARN_US = 80000;
@@ -35,7 +35,7 @@ struct TxMessage {
 static StaticQueue_t s_tx_queue_storage;
 static TxMessage s_tx_queue_buffer[TX_QUEUE_DEPTH];
 static QueueHandle_t s_tx_queue = nullptr;
-static TaskHandle_t s_capture_task = nullptr;
+static TaskHandle_t s_bridge_task = nullptr;
 static TaskHandle_t s_tx_task = nullptr;
 static volatile bool s_running = false;
 
@@ -61,7 +61,8 @@ static bool tx_queue_push(char *json, size_t json_len)
         return true;
     }
 
-    // Bounded latency: discard oldest pending audio message.
+    // Audio is realtime: never build unlimited backlog. Drop the oldest
+    // pending message and keep the newest captured audio.
     TxMessage oldest{};
     if (xQueueReceive(s_tx_queue, &oldest, 0) == pdTRUE) {
         free(oldest.json);
@@ -79,11 +80,9 @@ static bool tx_queue_push(char *json, size_t json_len)
 
 static void websocket_audio_tx_task(void *)
 {
-    ESP_LOGI(TAG, "Audio TX sender START: queue=%u messages (~%ums)",
+    ESP_LOGI(TAG, "Audio TX sender START: depth=%u (~%ums pending)",
              (unsigned)TX_QUEUE_DEPTH,
              (unsigned)(TX_QUEUE_DEPTH * FRAMES_PER_MESSAGE * 20));
-
-    uint32_t sent_count = 0;
 
     while (s_running) {
         TxMessage message{};
@@ -107,7 +106,6 @@ static void websocket_audio_tx_task(void *)
         const int64_t send_elapsed_us = esp_timer_get_time() - send_start_us;
         const size_t message_len = message.len;
         free(message.json);
-        ++sent_count;
 
         if (queue_wait_us >= SEND_WARN_US) {
             ESP_LOGW(TAG, "Audio TX queue wait=%lld ms json=%uB",
@@ -131,13 +129,13 @@ static void websocket_audio_tx_task(void *)
     vTaskDelete(nullptr);
 }
 
-static void websocket_audio_capture_task(void *)
+static void websocket_audio_bridge_task(void *)
 {
     static int16_t message_pcm[MESSAGE_SAMPLES];
     static int16_t frame_pcm[FRAME_SAMPLES];
     size_t frames_collected = 0;
 
-    ESP_LOGI(TAG, "Audio uplink bridge START: AudioEngine -> WebSocket");
+    ESP_LOGI(TAG, "Audio uplink bridge START: AudioEngine -> Gemini");
 
     while (s_running) {
         if (!websocket_is_connected() || !websocket_event_gemini_ready()) {
@@ -152,7 +150,7 @@ static void websocket_audio_capture_task(void *)
 
         if (!s_running) break;
 
-        memcpy(&message_pcm[frames_collected * FRAME_SAMPLES],
+        memcpy(message_pcm + (frames_collected * FRAME_SAMPLES),
                frame_pcm,
                FRAME_SAMPLES * sizeof(int16_t));
         ++frames_collected;
@@ -177,7 +175,7 @@ static void websocket_audio_capture_task(void *)
         frames_collected = 0;
     }
 
-    s_capture_task = nullptr;
+    s_bridge_task = nullptr;
     ESP_LOGI(TAG, "Audio uplink bridge STOP");
     vTaskDelete(nullptr);
 }
@@ -191,12 +189,12 @@ bool websocket_audio_start(void)
     }
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
-    while ((s_capture_task || s_tx_task) &&
+    while ((s_bridge_task || s_tx_task) &&
            (int32_t)(xTaskGetTickCount() - deadline) < 0) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    if (s_capture_task || s_tx_task) {
+    if (s_bridge_task || s_tx_task) {
         ESP_LOGW(TAG, "Audio bridge task sebelumnya belum selesai");
         return false;
     }
@@ -228,12 +226,12 @@ bool websocket_audio_start(void)
         return false;
     }
 
-    if (xTaskCreate(websocket_audio_capture_task,
+    if (xTaskCreate(websocket_audio_bridge_task,
                     "ws_audio",
-                    CAPTURE_TASK_STACK,
+                    BRIDGE_TASK_STACK,
                     nullptr,
                     TASK_PRIORITY,
-                    &s_capture_task) != pdPASS) {
+                    &s_bridge_task) != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "Gagal membuat task ws_audio");
         return false;
