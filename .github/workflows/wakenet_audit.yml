@@ -70,8 +70,8 @@ jobs:
           grep -n 'wakeword_process_pcm16' components/audio_engine/audio_engine.cpp
 
           echo "--- Audio format contract ---"
-          grep -nF 'wakeword_get_sample_rate() != 16000' components/audio_engine/audio_engine.cpp
-          grep -nF 'PCM_BLOCK_SAMPLES = 512' components/audio_engine/audio_engine.cpp
+          grep -nE 'wakeword_get_sample_rate\(\)[[:space:]]*!=[[:space:]]*16000' components/audio_engine/audio_engine.cpp
+          grep -nE 'PCM_BLOCK_SAMPLES[[:space:]]*=[[:space:]]*512' components/audio_engine/audio_engine.cpp
 
           if [ -f artifacts/firmware.elf ]; then
             ELF=artifacts/firmware.elf
