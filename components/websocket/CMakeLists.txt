@@ -18,4 +18,6 @@ idf_component_register(
         web_config
         audio_engine
         wifi_manager
+        uart_control
+        display_face
 )
