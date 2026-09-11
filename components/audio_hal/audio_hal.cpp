@@ -165,8 +165,10 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
         s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
     }
 
-    // The I2S driver can return a partial write when the DMA ring becomes
-    // available only in smaller pieces. Do not drop the unwritten PCM.
+    // The I2S driver may return ESP_ERR_TIMEOUT together with a partial
+    // write when the DMA ring only accepts the currently available portion.
+    // A timeout with progress is therefore not a failed PCM write: continue
+    // from the unwritten sample instead of dropping the remainder.
     size_t total_written = 0;
     while (total_written < samples) {
         size_t bytes_written = 0;
@@ -181,14 +183,16 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
         const size_t chunk_written = bytes_written / sizeof(int32_t);
         total_written += chunk_written;
 
-        if (err != ESP_OK) {
-            *samples_written = total_written;
-            return err;
-        }
-
         if (chunk_written == 0) {
             *samples_written = total_written;
-            return ESP_ERR_TIMEOUT;
+            return err == ESP_OK ? ESP_ERR_TIMEOUT : err;
+        }
+
+        // Partial progress followed by ESP_ERR_TIMEOUT is expected here.
+        // Keep draining the same PCM block until all samples are accepted.
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+            *samples_written = total_written;
+            return err;
         }
     }
 
