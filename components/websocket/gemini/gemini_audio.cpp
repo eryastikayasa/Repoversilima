@@ -18,19 +18,10 @@ static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
 
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
-    size_t remaining = bytes / sizeof(int16_t);
+    const size_t samples = bytes / sizeof(int16_t);
 
-    while (remaining > 0) {
-        const size_t chunk = remaining > 1024 ? 1024 : remaining;
-        if (!audio_engine_write_speaker_pcm(pcm, chunk, 100)) {
-            ESP_LOGW(TAG, "Gagal enqueue PCM speaker: samples=%u", (unsigned)chunk);
-            return false;
-        }
-        pcm += chunk;
-        remaining -= chunk;
-    }
-
-    return true;
+    // AudioEngine owns the speaker path. WebSocket/Gemini only hands PCM over.
+    return audio_engine_write_speaker_pcm(pcm, samples, 20);
 }
 
 static bool process_inline_audio(cJSON *inline_data)
@@ -129,8 +120,8 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         }
     }
 
-    // turnComplete only means Gemini has finished sending this model turn.
-    // PCM may still be queued inside AudioEngine, so do not stop I2S here.
+    // turnComplete only marks the end of Gemini's model turn. AudioEngine may
+    // still have buffered PCM to play, so leave playback running to drain.
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
         ESP_LOGI(TAG, "Turn complete: PCM playback dibiarkan drain");
