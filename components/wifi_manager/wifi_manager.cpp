@@ -203,3 +203,28 @@ bool wifi_is_ready(void)
 {
     return (s_wifi_started && s_wifi_got_ip);
 }
+
+void wifi_log_diagnostic(void)
+{
+    if (!s_wifi_started) {
+        ESP_LOGI(TAG, "Wi-Fi DIAG: driver=NOT_STARTED");
+        return;
+    }
+
+    wifi_ap_record_t ap = {};
+    const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi DIAG: link=NO_AP err=%s got_ip=%u",
+                 esp_err_to_name(err),
+                 s_wifi_got_ip ? 1U : 0U);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "Wi-Fi DIAG: rssi=%d dBm channel=%u phy=%u bw=%u got_ip=%u",
+             (int)ap.rssi,
+             (unsigned)ap.primary,
+             (unsigned)ap.phy_11b,
+             (unsigned)ap.second,
+             s_wifi_got_ip ? 1U : 0U);
+}
