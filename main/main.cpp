@@ -7,6 +7,7 @@
 #include "websocket.h"
 #include "websocket_audio.h"
 #include "websocket_event.h"
+#include "uart_control.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_timer.h"
@@ -31,18 +32,13 @@ static bool finish_conversation_lossless(void)
 {
     ESP_LOGI(TAG,"SESSION TIMEOUT: 60s tanpa aktivitas Gemini/MIC -> drain audio");
     display_text_set_status("Menyelesaikan audio...");
-
-    // First stop MIC production. No new PCM may enter TX while draining.
     audio_engine_stop_conversation();
-
     const bool tx_ok=websocket_audio_drain_stop();
     const bool rx_ok=websocket_event_drain();
     const bool playback_ok=audio_engine_drain_playback();
-
     if(!tx_ok||!rx_ok||!playback_ok){
         ESP_LOGE(TAG,"SESSION DRAIN GAGAL: TX=%d RX=%d PLAYBACK=%d; tidak mengklaim audio lengkap",(int)tx_ok,(int)rx_ok,(int)playback_ok);
     }
-
     websocket_disconnect();
     display_face_set_state(FACE_IDLE);
     display_text_set_status("Siap - ucap HI ESP");
@@ -61,6 +57,7 @@ extern "C" void app_main(void)
     display_face_set_state(FACE_IDLE);display_text_set_status("WiFi OK");
     if(!init_websocket()){display_face_set_state(FACE_ERROR);display_text_set_status("WebSocket gagal");while(true)vTaskDelay(pdMS_TO_TICKS(1000));}
     if(!init_boot_button()){display_face_set_state(FACE_ERROR);display_text_set_status("BOOT gagal");while(true)vTaskDelay(pdMS_TO_TICKS(1000));}
+    uart_control_init();
     if(!init_wakeword()){display_face_set_state(FACE_ERROR);display_text_set_status("WakeWord gagal");while(true)vTaskDelay(pdMS_TO_TICKS(1000));}
 
     bool boot_button_down=(gpio_get_level(BOOT_BUTTON_GPIO)==0);
@@ -69,9 +66,7 @@ extern "C" void app_main(void)
         const bool boot_pressed=(gpio_get_level(BOOT_BUTTON_GPIO)==0);
         if(boot_pressed&&!boot_button_down){vTaskDelay(pdMS_TO_TICKS(30));if(gpio_get_level(BOOT_BUTTON_GPIO)==0){if(start_conversation())session_active=true;boot_button_down=true;}}
         else if(!boot_pressed)boot_button_down=false;
-
         if(!session_active&&audio_engine_wakeword_detected()){audio_engine_clear_wakeword();if(start_conversation())session_active=true;}
-
         if(session_active){
             const int64_t last=websocket_event_last_activity_us();
             if(last>0&&esp_timer_get_time()-last>=SESSION_INACTIVITY_US){finish_conversation_lossless();session_active=false;}
