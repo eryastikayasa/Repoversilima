@@ -3,6 +3,7 @@
 #include "websocket_event.h"
 #include "gemini_protocol.h"
 #include "audio_engine.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
@@ -107,6 +108,8 @@ static void log_tx_diagnostic(uint32_t sent_count, int64_t send_elapsed_us)
              (unsigned)free_heap,
              (unsigned)min_heap,
              (unsigned)(cpu_hz / 1000000U));
+
+    wifi_log_diagnostic();
 }
 
 static void websocket_audio_tx_task(void *)
