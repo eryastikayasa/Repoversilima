@@ -55,7 +55,7 @@ static bool init_audio_pools(void) {
     s_playback_free_queue=xQueueCreateStatic(PLAYBACK_QUEUE_DEPTH,sizeof(PlaybackBlock *),reinterpret_cast<uint8_t *>(s_playback_free_queue_buffer),&s_playback_free_queue_storage);
     s_playback_ready_queue=xQueueCreateStatic(PLAYBACK_QUEUE_DEPTH,sizeof(PlaybackBlock *),reinterpret_cast<uint8_t *>(s_playback_ready_queue_buffer),&s_playback_ready_queue_storage);
     if(!s_mic_free_queue||!s_mic_ready_queue||!s_playback_free_queue||!s_playback_ready_queue)return false;
-    for(size_t i=0;i<MIC_QUEUE_DEPTH;++i){s_mic_buffers[i]=static_cast<uint8_t *>(heap_caps_malloc(MIC_FRAME_BYTES,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);if(!s_mic_buffers[i]){free_audio_pools();return false;}if(xQueueSend(s_mic_free_queue,&s_mic_buffers[i],0)!=pdPASS){free_audio_pools();return false;}}
+    for(size_t i=0;i<MIC_QUEUE_DEPTH;++i){s_mic_buffers[i]=static_cast<uint8_t *>(heap_caps_malloc(MIC_FRAME_BYTES,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(!s_mic_buffers[i]){free_audio_pools();return false;}if(xQueueSend(s_mic_free_queue,&s_mic_buffers[i],0)!=pdPASS){free_audio_pools();return false;}}
     for(size_t i=0;i<PLAYBACK_QUEUE_DEPTH;++i){s_playback_buffers[i]=static_cast<PlaybackBlock *>(heap_caps_malloc(PLAYBACK_BLOCK_BYTES+sizeof(uint16_t),MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(!s_playback_buffers[i]){free_audio_pools();return false;}s_playback_buffers[i]->samples=0;if(xQueueSend(s_playback_free_queue,&s_playback_buffers[i],0)!=pdPASS){free_audio_pools();return false;}}
     ESP_LOGI(TAG,"Audio buffers siap (PSRAM)");return true;
 }
