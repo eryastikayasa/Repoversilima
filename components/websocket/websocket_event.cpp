@@ -14,7 +14,6 @@
 
 static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
-
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static constexpr size_t RX_BUFFER_COUNT = 10;
@@ -89,9 +88,7 @@ static bool ensure_rx_worker(void)
                     ESP_LOGW(TAG, "Gemini RX RAW: %.*s", (int)log_len, json);
                 }
 
-                while (xQueueSend(s_rx_free_queue, &json, RX_BACKPRESSURE_WAIT) != pdPASS) {
-                    // Keep ownership until the bounded free queue accepts the buffer.
-                }
+                while (xQueueSend(s_rx_free_queue, &json, RX_BACKPRESSURE_WAIT) != pdPASS) {}
             }
         }, "ws_rx", RX_WORKER_STACK, nullptr, RX_WORKER_PRIORITY, &s_rx_worker_task);
 
@@ -119,7 +116,7 @@ static bool acquire_rx_buffer(char **buffer)
 {
     if (!buffer || !s_rx_free_queue) return false;
     while (xQueueReceive(s_rx_free_queue, buffer, RX_BACKPRESSURE_WAIT) != pdPASS) {
-        if (!s_gemini_ready) return false;
+        if (!websocket_transport_is_connected()) return false;
     }
     return *buffer != nullptr;
 }
@@ -145,7 +142,7 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     if (offset == 0) {
         reset_rx();
         if (!acquire_rx_buffer(&s_rx_assembling_buffer)) {
-            ESP_LOGW(TAG, "RX backpressure berhenti karena Gemini tidak READY");
+            ESP_LOGW(TAG, "RX tidak dapat memperoleh buffer karena WebSocket sudah putus");
             return;
         }
         s_rx_expected = payload_len;
@@ -168,10 +165,9 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     s_rx_received = 0;
     s_rx_assembling = false;
 
-    while (s_gemini_ready && xQueueSend(s_rx_ready_queue, &ready_buffer, RX_BACKPRESSURE_WAIT) != pdPASS) {
-        // Backpressure: RX worker must consume before another complete payload is accepted.
-    }
-    if (!s_gemini_ready) {
+    while (websocket_transport_is_connected() && xQueueSend(s_rx_ready_queue, &ready_buffer, RX_BACKPRESSURE_WAIT) != pdPASS) {}
+    if (!websocket_transport_is_connected()) {
+        ESP_LOGW(TAG, "RX payload selesai tetapi koneksi putus; payload di-abort bersama lifecycle");
         (void)xQueueSend(s_rx_free_queue, &ready_buffer, 0);
     }
 }
