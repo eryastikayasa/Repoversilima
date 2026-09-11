@@ -16,20 +16,15 @@ static bool s_logged_first_audio = false;
 static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
 {
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
-
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const size_t samples = bytes / sizeof(int16_t);
-
-    // AudioEngine owns the speaker path. WebSocket/Gemini only hands PCM over.
-    return audio_engine_write_speaker_pcm(pcm, samples, 20);
+    return audio_engine_write_speaker_pcm(pcm, samples, UINT32_MAX);
 }
 
 static bool process_inline_audio(cJSON *inline_data)
 {
     cJSON *encoded = cJSON_GetObjectItemCaseSensitive(inline_data, "data");
-    if (!cJSON_IsString(encoded) || !encoded->valuestring || encoded->valuestring[0] == '\0') {
-        return false;
-    }
+    if (!cJSON_IsString(encoded) || !encoded->valuestring || encoded->valuestring[0] == '\0') return false;
 
     cJSON *mime = cJSON_GetObjectItemCaseSensitive(inline_data, "mimeType");
     if (cJSON_IsString(mime) && mime->valuestring &&
@@ -48,11 +43,8 @@ static bool process_inline_audio(cJSON *inline_data)
 
     size_t decoded_len = 0;
     const int rc = mbedtls_base64_decode(
-        pcm,
-        capacity,
-        &decoded_len,
-        reinterpret_cast<const unsigned char *>(encoded->valuestring),
-        b64_len);
+        pcm, capacity, &decoded_len,
+        reinterpret_cast<const unsigned char *>(encoded->valuestring), b64_len);
 
     if (rc != 0 || decoded_len == 0 || (decoded_len & 1U) != 0) {
         ESP_LOGW(TAG, "Decode PCM Base64 gagal: rc=%d bytes=%u", rc, (unsigned)decoded_len);
@@ -62,7 +54,7 @@ static bool process_inline_audio(cJSON *inline_data)
 
     if (!s_playback_active) {
         if (!audio_engine_start_playback()) {
-            ESP_LOGE(TAG, "AudioEngine playback START gagal");
+            ESP_LOGE(TAG, "AudioEngine playback START gagal; PCM tidak dapat diputar");
             free(pcm);
             return false;
         }
@@ -76,6 +68,7 @@ static bool process_inline_audio(cJSON *inline_data)
     }
 
     const bool ok = write_pcm_bytes(pcm, decoded_len);
+    if (!ok) ESP_LOGE(TAG, "AudioEngine menolak PCM Gemini; audio payload tidak lengkap");
     free(pcm);
     return ok;
 }
@@ -83,7 +76,6 @@ static bool process_inline_audio(cJSON *inline_data)
 bool gemini_audio_process_server_message(const char *json, size_t len)
 {
     if (!json || len == 0) return false;
-
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) return false;
 
@@ -112,16 +104,15 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         for (int i = 0; i < count; ++i) {
             cJSON *part = cJSON_GetArrayItem(parts, i);
             if (!cJSON_IsObject(part)) continue;
-
             cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
-            if (cJSON_IsObject(inline_data) && process_inline_audio(inline_data)) {
-                handled = true;
+            if (cJSON_IsObject(inline_data)) {
+                const bool audio_ok = process_inline_audio(inline_data);
+                if (!audio_ok) ESP_LOGE(TAG, "Gemini audio part gagal diteruskan ke AudioEngine");
+                handled = audio_ok || handled;
             }
         }
     }
 
-    // turnComplete only marks the end of Gemini's model turn. AudioEngine may
-    // still have buffered PCM to play, so leave playback running to drain.
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
         ESP_LOGI(TAG, "Turn complete: PCM playback dibiarkan drain");
