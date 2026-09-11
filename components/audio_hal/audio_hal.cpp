@@ -65,6 +65,10 @@ void audio_hal_init(void)
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
     tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
         I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    // Match the proven Repo4 speaker configuration exactly.
+    tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
+    tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
     tx_cfg.slot_cfg.ws_pol = false;
     tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
