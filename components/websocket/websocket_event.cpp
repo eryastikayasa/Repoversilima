@@ -20,11 +20,9 @@ static volatile int64_t s_last_activity_us=0;
 static volatile bool s_rx_processing=false;
 static bool s_greeting_sent=false;
 static constexpr size_t RX_MAX_PAYLOAD=64*1024;
-static constexpr size_t RX_DIAGNOSTIC_MAX=512;
 static constexpr size_t RX_BUFFER_COUNT=10;
 static constexpr uint32_t RX_WORKER_STACK=8192;
 static constexpr UBaseType_t RX_WORKER_PRIORITY=5;
-static constexpr uint32_t RX_DIAGNOSTIC_EVERY=10;
 static constexpr int64_t RX_PROCESS_WARN_US=50000;
 static constexpr uint32_t SETUP_TASK_STACK=4096;
 static constexpr UBaseType_t SETUP_TASK_PRIORITY=5;
@@ -73,12 +71,11 @@ static bool ensure_rx_worker(void)
 {
     if(s_rx_worker_ready)return true;
     s_rx_free_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_free_storage),&s_rx_free_queue_storage);s_rx_ready_queue=xQueueCreateStatic(RX_BUFFER_COUNT,sizeof(char *),reinterpret_cast<uint8_t *>(s_rx_ready_storage),&s_rx_ready_queue_storage);if(!s_rx_free_queue||!s_rx_ready_queue)return false;
-    for(size_t i=0;i<RX_BUFFER_COUNT;++i){s_rx_buffers[i]=static_cast<char *>(heap_caps_malloc(RX_MAX_PAYLOAD+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));if(!s_rx_buffers[i]){ESP_LOGE(TAG,"Gagal alokasi RX buffer PSRAM #%u",(unsigned)i);return false;}if(xQueueSend(s_rx_free_queue,&s_rx_buffers[i],0)!=pdPASS)return false;}
-    BaseType_t result=xTaskCreate([](void *){ESP_LOGI(TAG,"Gemini RX worker START: %u x %uKB PSRAM",(unsigned)RX_BUFFER_COUNT,(unsigned)(RX_MAX_PAYLOAD/1024));uint32_t process_count=0;while(true){char *json=nullptr;if(xQueueReceive(s_rx_ready_queue,&json,portMAX_DELAY)!=pdPASS)continue;if(!json)continue;s_rx_processing=true;const size_t len=strlen(json);const int64_t start_us=esp_timer_get_time();const gemini_message_type_t type=gemini_message_classify(json,len);const bool protocol_handled=gemini_protocol_process_message(json,len);const bool tool_handled=(type==GEMINI_MESSAGE_TOOL)&&process_gemini_tool_call(json,len);const bool audio_handled=gemini_audio_process_server_message(json,len);const bool handled=protocol_handled||tool_handled||audio_handled;const int64_t elapsed_us=esp_timer_get_time()-start_us;++process_count;
-        if(elapsed_us>=RX_PROCESS_WARN_US)ESP_LOGW(TAG,"RX process lambat: %lld ms payload=%uB free=%u ready=%u",(long long)(elapsed_us/1000),(unsigned)len,(unsigned)uxQueueMessagesWaiting(s_rx_free_queue),(unsigned)uxQueueMessagesWaiting(s_rx_ready_queue));
-        if((process_count%RX_DIAGNOSTIC_EVERY)==0)ESP_LOGI(TAG,"RX DIAG: count=%u process=%lldms payload=%uB free=%u/%u ready=%u/%u stack_free=%u",(unsigned)process_count,(long long)(elapsed_us/1000),(unsigned)len,(unsigned)uxQueueMessagesWaiting(s_rx_free_queue),(unsigned)RX_BUFFER_COUNT,(unsigned)uxQueueMessagesWaiting(s_rx_ready_queue),(unsigned)RX_BUFFER_COUNT,(unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    for(size_t i=0;i<RX_BUFFER_COUNT;++i){s_rx_buffers[i]=static_cast<char *>(heap_caps_malloc(RX_MAX_PAYLOAD+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);if(!s_rx_buffers[i]){ESP_LOGE(TAG,"Gagal alokasi RX buffer PSRAM #%u",(unsigned)i);return false;}if(xQueueSend(s_rx_free_queue,&s_rx_buffers[i],0)!=pdPASS)return false;}
+    BaseType_t result=xTaskCreate([](void *){while(true){char *json=nullptr;if(xQueueReceive(s_rx_ready_queue,&json,portMAX_DELAY)!=pdPASS)continue;if(!json)continue;s_rx_processing=true;const size_t len=strlen(json);const int64_t start_us=esp_timer_get_time();const gemini_message_type_t type=gemini_message_classify(json,len);const bool protocol_handled=gemini_protocol_process_message(json,len);const bool tool_handled=(type==GEMINI_MESSAGE_TOOL)&&process_gemini_tool_call(json,len);const bool audio_handled=gemini_audio_process_server_message(json,len);const bool handled=protocol_handled||tool_handled||audio_handled;const int64_t elapsed_us=esp_timer_get_time()-start_us;
+        if(elapsed_us>=RX_PROCESS_WARN_US)ESP_LOGW(TAG,"RX process lambat: %lld ms",(long long)(elapsed_us/1000));
         if(type==GEMINI_MESSAGE_SETUP){s_gemini_ready=true;ESP_LOGI(TAG,"Gemini setupComplete - audio uplink READY");if(!s_greeting_sent&&websocket_transport_is_connected()){char *greeting=nullptr;size_t greeting_len=0;if(gemini_protocol_build_realtime_text("halo ",&greeting,&greeting_len)){const esp_err_t err=websocket_transport_send_text(greeting,greeting_len);if(err==ESP_OK){s_greeting_sent=true;ESP_LOGI(TAG,"Gemini greeting trigger terkirim");}else ESP_LOGE(TAG,"Gagal mengirim Gemini greeting trigger: %s",esp_err_to_name(err));free(greeting);}else ESP_LOGE(TAG,"Gagal membuat Gemini greeting trigger");}}
-        if(!handled){const size_t log_len=len<RX_DIAGNOSTIC_MAX?len:RX_DIAGNOSTIC_MAX;ESP_LOGW(TAG,"Gemini RX belum dipetakan (%u byte)",(unsigned)len);ESP_LOGW(TAG,"Gemini RX RAW: %.*s",(int)log_len,json);}while(xQueueSend(s_rx_free_queue,&json,RX_BACKPRESSURE_WAIT)!=pdPASS){}s_rx_processing=false;}},"ws_rx",RX_WORKER_STACK,nullptr,RX_WORKER_PRIORITY,&s_rx_worker_task);if(result!=pdPASS)return false;s_rx_worker_ready=true;return true;
+        if(!handled)ESP_LOGW(TAG,"Gemini RX message tidak dipetakan (%u byte)",(unsigned)len);while(xQueueSend(s_rx_free_queue,&json,RX_BACKPRESSURE_WAIT)!=pdPASS){}s_rx_processing=false;}},"ws_rx",RX_WORKER_STACK,nullptr,RX_WORKER_PRIORITY,&s_rx_worker_task);if(result!=pdPASS)return false;s_rx_worker_ready=true;return true;
 }
 
 bool websocket_event_init(void){return ensure_rx_worker();}
