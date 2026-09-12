@@ -22,7 +22,7 @@ static constexpr uint32_t TX_TASK_STACK = 4096;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
 static constexpr uint32_t STOP_WAIT_MS = 15000;
 
-struct TxMessage { char *json; size_t len; int64_t queued_at_us; };
+struct TxMessage { char *json; size_t len; size_t samples; int64_t queued_at_us; };
 static StaticQueue_t s_tx_queue_storage;
 static TxMessage s_tx_queue_buffer[TX_QUEUE_DEPTH];
 static QueueHandle_t s_tx_queue = nullptr;
@@ -32,15 +32,44 @@ static volatile bool s_running = false;
 static volatile bool s_draining = false;
 static volatile bool s_tx_fatal_error = false;
 static uint32_t s_tx_message_count = 0;
+static uint32_t s_tx_queued_message_count = 0;
+static uint64_t s_mic_frames_captured = 0;
+static uint64_t s_mic_samples_captured = 0;
+static uint64_t s_tx_samples_queued = 0;
+static uint64_t s_tx_samples_sent = 0;
 
-static bool tx_queue_push_blocking(char *json, size_t json_len)
+static void tx_audit_log(const char *stage)
+{
+    const uint64_t pending_samples = s_tx_samples_queued - s_tx_samples_sent;
+    const unsigned pending_messages = (unsigned)uxQueueMessagesWaiting(s_tx_queue);
+    const bool pass = !s_tx_fatal_error &&
+                      s_mic_samples_captured == s_tx_samples_queued &&
+                      s_tx_samples_queued == s_tx_samples_sent &&
+                      pending_samples == 0 && pending_messages == 0;
+    ESP_LOGI(TAG,
+             "TX AUDIT %s: MIC frames=%llu samples=%llu | queued msg=%u samples=%llu | sent msg=%u samples=%llu | pending msg=%u samples=%llu | RESULT=%s",
+             stage,
+             (unsigned long long)s_mic_frames_captured,
+             (unsigned long long)s_mic_samples_captured,
+             (unsigned)s_tx_queued_message_count,
+             (unsigned long long)s_tx_samples_queued,
+             (unsigned)s_tx_message_count,
+             (unsigned long long)s_tx_samples_sent,
+             pending_messages,
+             (unsigned long long)pending_samples,
+             pass ? "PASS" : "WAIT/FAIL");
+}
+
+static bool tx_queue_push_blocking(char *json, size_t json_len, size_t samples)
 {
     if (!json || json_len == 0 || !s_tx_queue) { free(json); return false; }
-    TxMessage message{json, json_len, esp_timer_get_time()};
+    TxMessage message{json, json_len, samples, esp_timer_get_time()};
     while (s_running || s_draining) {
         if (xQueueSend(s_tx_queue, &message, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "MIC->TX: message #%u queued, json=%u byte, queue=%u/%u",
-                     (unsigned)(s_tx_message_count + 1), (unsigned)json_len,
+            ++s_tx_queued_message_count;
+            s_tx_samples_queued += samples;
+            ESP_LOGI(TAG, "MIC->TX: msg=%u samples=%u json=%u queue=%u/%u",
+                     (unsigned)s_tx_queued_message_count, (unsigned)samples, (unsigned)json_len,
                      (unsigned)uxQueueMessagesWaiting(s_tx_queue), (unsigned)TX_QUEUE_DEPTH);
             return true;
         }
@@ -61,9 +90,12 @@ static bool send_message_until_delivered(TxMessage *message)
         const esp_err_t err = websocket_send_text(message->json, message->len);
         if (err == ESP_OK) {
             ++s_tx_message_count;
-            ESP_LOGI(TAG, "TX->Gemini: message #%u sent, json=%u byte, queue=%u/%u",
-                     (unsigned)s_tx_message_count, (unsigned)message->len,
-                     (unsigned)uxQueueMessagesWaiting(s_tx_queue), (unsigned)TX_QUEUE_DEPTH);
+            s_tx_samples_sent += message->samples;
+            const uint64_t pending_samples = s_tx_samples_queued - s_tx_samples_sent;
+            ESP_LOGI(TAG, "TX->Gemini: msg=%u samples=%u json=%u queue=%u/%u pending_samples=%llu",
+                     (unsigned)s_tx_message_count, (unsigned)message->samples, (unsigned)message->len,
+                     (unsigned)uxQueueMessagesWaiting(s_tx_queue), (unsigned)TX_QUEUE_DEPTH,
+                     (unsigned long long)pending_samples);
             websocket_event_note_activity();
             return true;
         }
@@ -111,6 +143,8 @@ static void websocket_audio_bridge_task(void *)
             if (s_draining) break;
             continue;
         }
+        ++s_mic_frames_captured;
+        s_mic_samples_captured += FRAME_SAMPLES;
         memcpy(message_pcm + frames_collected * FRAME_SAMPLES, frame_pcm, FRAME_SAMPLES * sizeof(int16_t));
         ++frames_collected;
         if (frames_collected < FRAMES_PER_MESSAGE) continue;
@@ -124,7 +158,7 @@ static void websocket_audio_bridge_task(void *)
             break;
         }
         ESP_LOGI(TAG, "AudioEngine->TX: %u PCM samples -> %u byte JSON", (unsigned)MESSAGE_SAMPLES, (unsigned)json_len);
-        if (!tx_queue_push_blocking(json, json_len)) {
+        if (!tx_queue_push_blocking(json, json_len, MESSAGE_SAMPLES)) {
             s_tx_fatal_error = true;
             break;
         }
@@ -139,12 +173,13 @@ static void websocket_audio_bridge_task(void *)
         size_t json_len = 0;
         if (gemini_protocol_build_realtime_audio(message_pcm, final_samples, &json, &json_len)) {
             ESP_LOGI(TAG, "AudioEngine->TX: final %u PCM samples -> %u byte JSON", (unsigned)final_samples, (unsigned)json_len);
-            if (!tx_queue_push_blocking(json, json_len)) s_tx_fatal_error = true;
+            if (!tx_queue_push_blocking(json, json_len, final_samples)) s_tx_fatal_error = true;
         } else {
             s_tx_fatal_error = true;
         }
     }
 
+    tx_audit_log("BRIDGE DONE");
     s_bridge_task = nullptr;
     vTaskDelete(nullptr);
 }
@@ -166,6 +201,11 @@ bool websocket_audio_start(void)
     }
     s_tx_fatal_error = false;
     s_tx_message_count = 0;
+    s_tx_queued_message_count = 0;
+    s_mic_frames_captured = 0;
+    s_mic_samples_captured = 0;
+    s_tx_samples_queued = 0;
+    s_tx_samples_sent = 0;
     s_draining = false;
     s_running = true;
     websocket_event_note_activity();
@@ -196,6 +236,7 @@ bool websocket_audio_drain_stop(void)
     while (s_bridge_task && (int32_t)(xTaskGetTickCount() - bridge_deadline) < 0) vTaskDelay(pdMS_TO_TICKS(5));
     if (s_bridge_task) {
         ESP_LOGE(TAG, "TX bridge drain timeout: data belum boleh dibuang");
+        tx_audit_log("BRIDGE TIMEOUT");
         return false;
     }
 
@@ -203,8 +244,10 @@ bool websocket_audio_drain_stop(void)
     while (s_tx_task && (int32_t)(xTaskGetTickCount() - tx_deadline) < 0) vTaskDelay(pdMS_TO_TICKS(10));
     if (s_tx_task) {
         ESP_LOGE(TAG, "TX queue drain timeout: audio belum lengkap dan tidak dianggap selesai");
+        tx_audit_log("TX TIMEOUT");
         return false;
     }
+    tx_audit_log("DRAIN DONE");
     s_draining = false;
     return !s_tx_fatal_error && uxQueueMessagesWaiting(s_tx_queue) == 0;
 }
