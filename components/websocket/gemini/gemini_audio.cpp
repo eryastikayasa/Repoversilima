@@ -11,19 +11,101 @@
 #include <string.h>
 
 static const char *TAG = "GEMINI_AUDIO";
+
+// Gemini output arrives in network bursts. Keep a small PCM jitter buffer so
+// the speaker does not start on a tiny first packet and immediately underflow.
+static constexpr size_t JITTER_BUFFER_SAMPLES = 8192; // ~341 ms at 24 kHz
+static int16_t *s_jitter_buffer = nullptr;
+static size_t s_jitter_samples = 0;
 static bool s_playback_active = false;
 static bool s_logged_first_audio = false;
 static uint32_t s_audio_parts = 0;
+static uint64_t s_rx_samples_decoded = 0;
+static uint64_t s_rx_samples_accepted = 0;
+
+static bool ensure_jitter_buffer(void)
+{
+    if (s_jitter_buffer) return true;
+    s_jitter_buffer = static_cast<int16_t *>(
+        heap_caps_malloc(JITTER_BUFFER_SAMPLES * sizeof(int16_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_jitter_buffer) {
+        ESP_LOGE(TAG, "Gagal alokasi RX jitter buffer: %u samples",
+                 (unsigned)JITTER_BUFFER_SAMPLES);
+        return false;
+    }
+    return true;
+}
+
+static bool start_playback_if_needed(void)
+{
+    if (s_playback_active) return true;
+    if (!audio_engine_start_playback()) {
+        ESP_LOGE(TAG, "AudioEngine playback START gagal; PCM tidak dapat diputar");
+        return false;
+    }
+    s_playback_active = true;
+    s_logged_first_audio = false;
+    ESP_LOGI(TAG, "RX jitter buffer cukup: %u samples -> speaker START",
+             (unsigned)s_jitter_samples);
+    return true;
+}
+
+static bool flush_jitter_buffer(void)
+{
+    if (s_jitter_samples == 0) return true;
+    if (!start_playback_if_needed()) return false;
+
+    const bool ok = audio_engine_write_speaker_pcm(
+        s_jitter_buffer, s_jitter_samples, UINT32_MAX);
+    if (!ok) {
+        ESP_LOGE(TAG, "RX->AudioEngine gagal: %u samples",
+                 (unsigned)s_jitter_samples);
+        return false;
+    }
+    s_rx_samples_accepted += s_jitter_samples;
+    s_jitter_samples = 0;
+    return true;
+}
 
 static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
 {
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const size_t samples = bytes / sizeof(int16_t);
-    const bool ok = audio_engine_write_speaker_pcm(pcm, samples, UINT32_MAX);
-    ESP_LOGI(TAG, "RX->AudioEngine: PCM=%u bytes/%u samples result=%s",
-             (unsigned)bytes, (unsigned)samples, ok ? "OK" : "FAIL");
-    return ok;
+
+    if (!ensure_jitter_buffer()) return false;
+    s_rx_samples_decoded += samples;
+
+    size_t offset = 0;
+    while (offset < samples) {
+        const size_t free_samples = JITTER_BUFFER_SAMPLES - s_jitter_samples;
+        const size_t copy_samples = (samples - offset) < free_samples
+            ? (samples - offset) : free_samples;
+        memcpy(s_jitter_buffer + s_jitter_samples,
+               pcm + offset,
+               copy_samples * sizeof(int16_t));
+        s_jitter_samples += copy_samples;
+        offset += copy_samples;
+
+        if (s_jitter_samples == JITTER_BUFFER_SAMPLES) {
+            if (!flush_jitter_buffer()) return false;
+        }
+    }
+
+    // Once playback has started, pass through subsequent data immediately.
+    if (s_playback_active && s_jitter_samples > 0) {
+        if (!flush_jitter_buffer()) return false;
+    }
+
+    ESP_LOGI(TAG,
+             "RX->AudioEngine: PCM=%u bytes/%u samples accepted_total=%llu buffer=%u/%u",
+             (unsigned)bytes,
+             (unsigned)samples,
+             (unsigned long long)s_rx_samples_accepted,
+             (unsigned)s_jitter_samples,
+             (unsigned)JITTER_BUFFER_SAMPLES);
+    return true;
 }
 
 static bool process_inline_audio(cJSON *inline_data)
@@ -40,7 +122,8 @@ static bool process_inline_audio(cJSON *inline_data)
 
     const size_t b64_len = strlen(encoded->valuestring);
     const size_t capacity = (b64_len / 4U) * 3U + 3U;
-    uint8_t *pcm = static_cast<uint8_t *>(heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint8_t *pcm = static_cast<uint8_t *>(
+        heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!pcm) {
         ESP_LOGE(TAG, "Gagal alokasi buffer decode Base64: %u byte", (unsigned)capacity);
         return false;
@@ -57,16 +140,6 @@ static bool process_inline_audio(cJSON *inline_data)
         return false;
     }
 
-    if (!s_playback_active) {
-        if (!audio_engine_start_playback()) {
-            ESP_LOGE(TAG, "AudioEngine playback START gagal; PCM tidak dapat diputar");
-            heap_caps_free(pcm);
-            return false;
-        }
-        s_playback_active = true;
-        s_logged_first_audio = false;
-    }
-
     ++s_audio_parts;
     if (!s_logged_first_audio) {
         ESP_LOGI(TAG, "Gemini RX audio: part=%u b64=%u decoded=%u bytes (%u samples)",
@@ -77,6 +150,7 @@ static bool process_inline_audio(cJSON *inline_data)
 
     const bool ok = write_pcm_bytes(pcm, decoded_len);
     heap_caps_free(pcm);
+    if (!ok) ESP_LOGW(TAG, "Gemini audio part gagal diproses");
     return ok;
 }
 
@@ -99,8 +173,11 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
             audio_engine_stop_playback();
             s_playback_active = false;
         }
+        s_jitter_samples = 0;
         s_logged_first_audio = false;
         s_audio_parts = 0;
+        s_rx_samples_decoded = 0;
+        s_rx_samples_accepted = 0;
         ESP_LOGI(TAG, "Gemini interrupted: playback dihentikan");
         handled = true;
     }
@@ -115,7 +192,6 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
             cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
             if (cJSON_IsObject(inline_data)) {
                 const bool audio_ok = process_inline_audio(inline_data);
-                if (!audio_ok) ESP_LOGW(TAG, "Gemini audio part gagal diproses");
                 handled = audio_ok || handled;
             }
         }
@@ -123,7 +199,17 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
 
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
-        ESP_LOGI(TAG, "Turn complete: PCM playback drain");
+        // Do not leave a short final response trapped below the jitter threshold.
+        const bool flush_ok = flush_jitter_buffer();
+        const bool audit_pass = flush_ok &&
+                                 s_rx_samples_decoded == s_rx_samples_accepted &&
+                                 s_jitter_samples == 0;
+        ESP_LOGI(TAG,
+                 "RX AUDIT turnComplete: decoded=%llu accepted=%llu buffer=%u RESULT=%s",
+                 (unsigned long long)s_rx_samples_decoded,
+                 (unsigned long long)s_rx_samples_accepted,
+                 (unsigned)s_jitter_samples,
+                 audit_pass ? "PASS" : "FAIL");
         handled = true;
     }
 
