@@ -2,6 +2,7 @@
 
 #include "audio_engine.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
 
@@ -18,7 +19,7 @@ static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const size_t samples = bytes / sizeof(int16_t);
-    return audio_engine_write_speaker_pcm(pcm, samples, UINT32_MAX);
+    return audio_engine_write_speaker_pcm(pcm, samples, 20);
 }
 
 static bool process_inline_audio(cJSON *inline_data)
@@ -35,7 +36,7 @@ static bool process_inline_audio(cJSON *inline_data)
 
     const size_t b64_len = strlen(encoded->valuestring);
     const size_t capacity = (b64_len / 4U) * 3U + 3U;
-    uint8_t *pcm = static_cast<uint8_t *>(malloc(capacity));
+    uint8_t *pcm = static_cast<uint8_t *>(heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!pcm) {
         ESP_LOGE(TAG, "Gagal alokasi buffer decode Base64: %u byte", (unsigned)capacity);
         return false;
@@ -48,14 +49,14 @@ static bool process_inline_audio(cJSON *inline_data)
 
     if (rc != 0 || decoded_len == 0 || (decoded_len & 1U) != 0) {
         ESP_LOGW(TAG, "Decode PCM Base64 gagal: rc=%d bytes=%u", rc, (unsigned)decoded_len);
-        free(pcm);
+        heap_caps_free(pcm);
         return false;
     }
 
     if (!s_playback_active) {
         if (!audio_engine_start_playback()) {
             ESP_LOGE(TAG, "AudioEngine playback START gagal; PCM tidak dapat diputar");
-            free(pcm);
+            heap_caps_free(pcm);
             return false;
         }
         s_playback_active = true;
@@ -69,7 +70,7 @@ static bool process_inline_audio(cJSON *inline_data)
 
     const bool ok = write_pcm_bytes(pcm, decoded_len);
     if (!ok) ESP_LOGE(TAG, "AudioEngine menolak PCM Gemini; audio payload tidak lengkap");
-    free(pcm);
+    heap_caps_free(pcm);
     return ok;
 }
 
