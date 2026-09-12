@@ -20,9 +20,9 @@ static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const size_t samples = bytes / sizeof(int16_t);
-    const bool ok = audio_engine_write_speaker_pcm(pcm, samples, 20);
+    const bool ok = audio_engine_write_speaker_pcm(pcm, samples, UINT32_MAX);
     ESP_LOGI(TAG, "RX->AudioEngine: PCM=%u bytes/%u samples result=%s",
-             (unsigned)bytes, (unsigned)samples, ok ? "OK" : "DROP");
+             (unsigned)bytes, (unsigned)samples, ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -76,7 +76,6 @@ static bool process_inline_audio(cJSON *inline_data)
     }
 
     const bool ok = write_pcm_bytes(pcm, decoded_len);
-    if (!ok) ESP_LOGW(TAG, "Audio Gemini tertahan: playback queue penuh");
     heap_caps_free(pcm);
     return ok;
 }
@@ -116,7 +115,7 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
             cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
             if (cJSON_IsObject(inline_data)) {
                 const bool audio_ok = process_inline_audio(inline_data);
-                if (!audio_ok) ESP_LOGW(TAG, "Gemini audio part dilewati");
+                if (!audio_ok) ESP_LOGW(TAG, "Gemini audio part gagal diproses");
                 handled = audio_ok || handled;
             }
         }
