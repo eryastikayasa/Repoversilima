@@ -1,5 +1,4 @@
 #include "audio_engine.h"
-#include "audio_hal.h"
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -11,8 +10,7 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== RepoVersilima clean architecture boot ===");
 
-    // Proven hardware/system components remain external to the new data path.
-    audio_hal_init();
+    // Proven system components are not modified by the new data path.
     wifi_init_sta();
 
     if (!wifi_wait_for_connection(30000)) {
@@ -29,7 +27,7 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Speaker");
 
     // Gemini transport is intentionally not started here yet.
-    // The URI/session configuration will be supplied by the web-config layer.
+    // The URI/session configuration will be supplied by web-config.
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
