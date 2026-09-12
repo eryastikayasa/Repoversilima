@@ -22,6 +22,7 @@ static i2s_chan_handle_t s_tx = nullptr;
 static bool s_initialized = false;
 static bool s_capture_started = false;
 static bool s_playback_started = false;
+static uint32_t s_speaker_write_count = 0;
 
 // Keep the temporary I2S conversion buffers out of task stacks.
 // 1024 x 32-bit = 4096 bytes each.
@@ -138,6 +139,7 @@ esp_err_t audio_hal_start_playback(void)
     esp_err_t err = i2s_channel_enable(s_tx);
     if (err == ESP_OK) {
         s_playback_started = true;
+        s_speaker_write_count = 0;
         ESP_LOGI(TAG, "SPK playback START");
     }
     return err;
@@ -163,16 +165,10 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
     if (!s_playback_started || !s_tx) return ESP_ERR_INVALID_STATE;
     if (samples > 1024) return ESP_ERR_INVALID_SIZE;
 
-    // Speaker I2S is configured as 32-bit. Expand PCM16 to the 32-bit
-    // left-justified representation used by the Repo5 TX format.
     for (size_t i = 0; i < samples; ++i) {
         s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
     }
 
-    // Repo5 playback task owns this blocking hardware boundary. Do not split
-    // the block merely to match a DMA frame size. If the driver accepts only
-    // part of the block before a timeout, continue from the actual progress
-    // instead of dropping the unwritten PCM.
     size_t total_written = 0;
     while (total_written < samples) {
         size_t bytes_written = 0;
@@ -212,5 +208,10 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
     }
 
     *samples_written = total_written;
+    ++s_speaker_write_count;
+    if (s_speaker_write_count <= 3 || (s_speaker_write_count % 20) == 0) {
+        ESP_LOGI(TAG, "AudioEngine->I2S: write #%u %u/%u samples OK",
+                 (unsigned)s_speaker_write_count, (unsigned)total_written, (unsigned)samples);
+    }
     return ESP_OK;
 }
