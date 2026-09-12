@@ -33,23 +33,11 @@ static volatile bool s_draining = false;
 static volatile bool s_tx_fatal_error = false;
 static uint32_t s_tx_message_count = 0;
 
-static void tx_queue_flush(void)
-{
-    if (!s_tx_queue) return;
-    TxMessage message{};
-    size_t flushed = 0;
-    while (xQueueReceive(s_tx_queue, &message, 0) == pdTRUE) {
-        free(message.json);
-        ++flushed;
-    }
-    if (flushed) ESP_LOGW(TAG, "TX queue di-flush saat lifecycle abort: %u message", (unsigned)flushed);
-}
-
-static bool tx_queue_push(char *json, size_t json_len)
+static bool tx_queue_push_blocking(char *json, size_t json_len)
 {
     if (!json || json_len == 0 || !s_tx_queue) { free(json); return false; }
     TxMessage message{json, json_len, esp_timer_get_time()};
-    while (s_running) {
+    while (s_running || s_draining) {
         if (xQueueSend(s_tx_queue, &message, portMAX_DELAY) == pdTRUE) {
             ESP_LOGI(TAG, "MIC->TX: message #%u queued, json=%u byte, queue=%u/%u",
                      (unsigned)(s_tx_message_count + 1), (unsigned)json_len,
@@ -90,16 +78,13 @@ static void websocket_audio_tx_task(void *)
     while (s_running || s_draining) {
         TxMessage message{};
         if (xQueueReceive(s_tx_queue, &message, portMAX_DELAY) != pdTRUE) continue;
-        if (!message.json || message.len == 0) { free(message.json); continue; }
-        const bool sent = send_message_until_delivered(&message);
-        if (!sent) {
+        if (!message.json || message.len == 0) continue;
+        if (!send_message_until_delivered(&message)) {
+            s_tx_fatal_error = true;
             free(message.json);
             break;
         }
         free(message.json);
-    }
-    if (!s_draining && !s_running) {
-        // Jangan flush: lifecycle baru boleh kehilangan antrean setelah drain gagal ditangani caller.
     }
     s_tx_task = nullptr;
     vTaskDelete(nullptr);
@@ -110,33 +95,51 @@ static void websocket_audio_bridge_task(void *)
     static int16_t message_pcm[MESSAGE_SAMPLES];
     static int16_t frame_pcm[FRAME_SAMPLES];
     size_t frames_collected = 0;
-    while (s_running) {
+
+    while (s_running || s_draining) {
+        if (!s_running && s_draining) {
+            // No new microphone samples after stop; send the exact partial batch, if any.
+            break;
+        }
         if (!websocket_is_connected() || !websocket_event_gemini_ready()) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, UINT32_MAX)) continue;
-        if (!s_running) break;
+        if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, 100)) continue;
         memcpy(message_pcm + frames_collected * FRAME_SAMPLES, frame_pcm, FRAME_SAMPLES * sizeof(int16_t));
         ++frames_collected;
         if (frames_collected < FRAMES_PER_MESSAGE) continue;
+
         char *json = nullptr;
         size_t json_len = 0;
         if (!gemini_protocol_build_realtime_audio(message_pcm, MESSAGE_SAMPLES, &json, &json_len)) {
-            ESP_LOGE(TAG, "Gagal membuat realtime audio message; conversation abort");
+            ESP_LOGE(TAG, "Gagal membuat realtime audio message");
             s_tx_fatal_error = true;
             s_running = false;
-            frames_collected = 0;
-            continue;
+            break;
         }
         ESP_LOGI(TAG, "AudioEngine->TX: %u PCM samples -> %u byte JSON", (unsigned)MESSAGE_SAMPLES, (unsigned)json_len);
-        if (!tx_queue_push(json, json_len) && s_running) {
-            ESP_LOGE(TAG, "Audio TX queue gagal menerima message; conversation abort");
+        if (!tx_queue_push_blocking(json, json_len)) {
             s_tx_fatal_error = true;
-            s_running = false;
+            break;
         }
         frames_collected = 0;
     }
+
+    // Preserve 1..4 frames collected before stop. A smaller final realtimeInput is
+    // still exact PCM; no zero padding and no samples are invented or discarded.
+    if (frames_collected > 0 && !s_tx_fatal_error && s_tx_queue) {
+        const size_t final_samples = frames_collected * FRAME_SAMPLES;
+        char *json = nullptr;
+        size_t json_len = 0;
+        if (gemini_protocol_build_realtime_audio(message_pcm, final_samples, &json, &json_len)) {
+            ESP_LOGI(TAG, "AudioEngine->TX: final %u PCM samples -> %u byte JSON", (unsigned)final_samples, (unsigned)json_len);
+            if (!tx_queue_push_blocking(json, json_len)) s_tx_fatal_error = true;
+        } else {
+            s_tx_fatal_error = true;
+        }
+    }
+
     s_bridge_task = nullptr;
     vTaskDelete(nullptr);
 }
@@ -152,7 +155,10 @@ bool websocket_audio_start(void)
         s_tx_queue = xQueueCreateStatic(TX_QUEUE_DEPTH, sizeof(TxMessage), reinterpret_cast<uint8_t *>(s_tx_queue_buffer), &s_tx_queue_storage);
         if (!s_tx_queue) return false;
     }
-    tx_queue_flush();
+    if (uxQueueMessagesWaiting(s_tx_queue) != 0) {
+        ESP_LOGE(TAG, "TX queue masih berisi data; lifecycle sebelumnya belum drain");
+        return false;
+    }
     s_tx_fatal_error = false;
     s_tx_message_count = 0;
     s_draining = false;
@@ -176,21 +182,23 @@ bool websocket_audio_running(void) { return s_running; }
 
 bool websocket_audio_drain_stop(void)
 {
+    // Enter drain mode before stopping the bridge so its final partial PCM can be queued.
+    s_draining = true;
     s_running = false;
+
     const TickType_t bridge_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS);
     while (s_bridge_task && (int32_t)(xTaskGetTickCount() - bridge_deadline) < 0) vTaskDelay(pdMS_TO_TICKS(5));
     if (s_bridge_task) {
-        ESP_LOGE(TAG, "TX bridge drain timeout");
+        ESP_LOGE(TAG, "TX bridge drain timeout: data belum boleh dibuang");
         return false;
     }
 
-    s_draining = true;
     const TickType_t tx_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(STOP_WAIT_MS + 15000);
     while (s_tx_task && (int32_t)(xTaskGetTickCount() - tx_deadline) < 0) vTaskDelay(pdMS_TO_TICKS(10));
     if (s_tx_task) {
-        ESP_LOGE(TAG, "TX queue drain timeout: audio tidak boleh dianggap lengkap");
+        ESP_LOGE(TAG, "TX queue drain timeout: audio belum lengkap dan tidak dianggap selesai");
         return false;
     }
     s_draining = false;
-    return !s_tx_fatal_error;
+    return !s_tx_fatal_error && uxQueueMessagesWaiting(s_tx_queue) == 0;
 }
