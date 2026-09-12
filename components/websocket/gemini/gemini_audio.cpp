@@ -13,15 +13,17 @@
 static const char *TAG = "GEMINI_AUDIO";
 static bool s_playback_active = false;
 static bool s_logged_first_audio = false;
+static uint32_t s_audio_parts = 0;
 
 static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
 {
     if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
     const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
     const size_t samples = bytes / sizeof(int16_t);
-    // RX must never wait indefinitely on the speaker queue.
-    // AudioEngine owns the playback queue and playback task.
-    return audio_engine_write_speaker_pcm(pcm, samples, 20);
+    const bool ok = audio_engine_write_speaker_pcm(pcm, samples, 20);
+    ESP_LOGI(TAG, "RX->AudioEngine: PCM=%u bytes/%u samples result=%s",
+             (unsigned)bytes, (unsigned)samples, ok ? "OK" : "DROP");
+    return ok;
 }
 
 static bool process_inline_audio(cJSON *inline_data)
@@ -65,8 +67,11 @@ static bool process_inline_audio(cJSON *inline_data)
         s_logged_first_audio = false;
     }
 
+    ++s_audio_parts;
     if (!s_logged_first_audio) {
-        ESP_LOGI(TAG, "Audio Gemini diterima: %u byte PCM16", (unsigned)decoded_len);
+        ESP_LOGI(TAG, "Gemini RX audio: part=%u b64=%u decoded=%u bytes (%u samples)",
+                 (unsigned)s_audio_parts, (unsigned)b64_len, (unsigned)decoded_len,
+                 (unsigned)(decoded_len / sizeof(int16_t)));
         s_logged_first_audio = true;
     }
 
@@ -96,6 +101,7 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
             s_playback_active = false;
         }
         s_logged_first_audio = false;
+        s_audio_parts = 0;
         ESP_LOGI(TAG, "Gemini interrupted: playback dihentikan");
         handled = true;
     }
