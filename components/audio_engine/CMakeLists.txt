@@ -1,8 +1,5 @@
 idf_component_register(
-    SRCS
-        "audio_engine.cpp"
-        "audio_input.cpp"
-        "audio_output.cpp"
+    SRCS "audio_engine.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES audio_hal
+    REQUIRES audio_hal mbedtls
 )
