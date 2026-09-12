@@ -97,15 +97,20 @@ static void websocket_audio_bridge_task(void *)
     size_t frames_collected = 0;
 
     while (s_running || s_draining) {
-        if (!s_running && s_draining) {
-            // No new microphone samples after stop; send the exact partial batch, if any.
-            break;
-        }
         if (!websocket_is_connected() || !websocket_event_gemini_ready()) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+            if (s_draining) {
+                // During drain, do not discard already captured MIC frames merely because
+                // the transport is temporarily unavailable. Read them first, then queue.
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+        }
+
+        if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, 100)) {
+            if (s_draining) break;
             continue;
         }
-        if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, 100)) continue;
         memcpy(message_pcm + frames_collected * FRAME_SAMPLES, frame_pcm, FRAME_SAMPLES * sizeof(int16_t));
         ++frames_collected;
         if (frames_collected < FRAMES_PER_MESSAGE) continue;
@@ -126,8 +131,8 @@ static void websocket_audio_bridge_task(void *)
         frames_collected = 0;
     }
 
-    // Preserve 1..4 frames collected before stop. A smaller final realtimeInput is
-    // still exact PCM; no zero padding and no samples are invented or discarded.
+    // Preserve all frames already captured before stop. A final 1..4 frame batch is
+    // sent with its exact sample count; no zero padding and no samples are discarded.
     if (frames_collected > 0 && !s_tx_fatal_error && s_tx_queue) {
         const size_t final_samples = frames_collected * FRAME_SAMPLES;
         char *json = nullptr;
@@ -182,7 +187,8 @@ bool websocket_audio_running(void) { return s_running; }
 
 bool websocket_audio_drain_stop(void)
 {
-    // Enter drain mode before stopping the bridge so its final partial PCM can be queued.
+    // Drain mode is enabled before stopping the bridge. The bridge first consumes every
+    // already-captured MIC frame, then emits the exact final partial batch.
     s_draining = true;
     s_running = false;
 
