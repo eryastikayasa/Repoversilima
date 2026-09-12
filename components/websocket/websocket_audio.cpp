@@ -33,6 +33,7 @@ static TaskHandle_t s_tx_task = nullptr;
 static volatile bool s_running = false;
 static volatile bool s_draining = false;
 static volatile bool s_tx_fatal_error = false;
+static uint32_t s_tx_message_count = 0;
 
 static void tx_queue_flush(void)
 {
@@ -51,7 +52,12 @@ static bool tx_queue_push(char *json, size_t json_len)
     if (!json || json_len == 0 || !s_tx_queue) { free(json); return false; }
     TxMessage message{json, json_len, esp_timer_get_time()};
     while (s_running) {
-        if (xQueueSend(s_tx_queue, &message, pdMS_TO_TICKS(100)) == pdTRUE) return true;
+        if (xQueueSend(s_tx_queue, &message, pdMS_TO_TICKS(100)) == pdTRUE) {
+            ESP_LOGI(TAG, "MIC->TX: message #%u queued, json=%u byte, queue=%u/%u",
+                     (unsigned)(s_tx_message_count + 1), (unsigned)json_len,
+                     (unsigned)uxQueueMessagesWaiting(s_tx_queue), (unsigned)TX_QUEUE_DEPTH);
+            return true;
+        }
     }
     free(message.json);
     return false;
@@ -70,6 +76,10 @@ static bool send_message_with_retry(TxMessage *message)
         if (!(s_running || s_draining)) return false;
         const esp_err_t err = websocket_send_text(message->json, message->len);
         if (err == ESP_OK) {
+            ++s_tx_message_count;
+            ESP_LOGI(TAG, "TX->Gemini: message #%u sent, json=%u byte, queue=%u/%u",
+                     (unsigned)s_tx_message_count, (unsigned)message->len,
+                     (unsigned)uxQueueMessagesWaiting(s_tx_queue), (unsigned)TX_QUEUE_DEPTH);
             websocket_event_note_activity();
             return true;
         }
@@ -126,6 +136,7 @@ static void websocket_audio_bridge_task(void *)
             frames_collected = 0;
             continue;
         }
+        ESP_LOGI(TAG, "AudioEngine->TX: %u PCM samples -> %u byte JSON", (unsigned)MESSAGE_SAMPLES, (unsigned)json_len);
         if (!tx_queue_push(json, json_len) && s_running) {
             ESP_LOGE(TAG, "Audio TX queue gagal menerima message; conversation abort");
             s_tx_fatal_error = true;
@@ -150,6 +161,7 @@ bool websocket_audio_start(void)
     }
     tx_queue_flush();
     s_tx_fatal_error = false;
+    s_tx_message_count = 0;
     s_draining = false;
     s_running = true;
     websocket_event_note_activity();
