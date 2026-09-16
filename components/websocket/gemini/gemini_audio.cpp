@@ -206,12 +206,19 @@ static void playback_task(void *)
 
             if (s_turn_complete_pending && pending == 0 && received == 0) {
                 s_turn_complete_pending = false;
-                ESP_LOGI(TAG, "AUDIO PLAYBACK COMPLETE: ring drain selesai; SESSION tetap hidup");
+                s_playback_active = false;
+                s_logged_first_audio = false;
+                ESP_LOGI(TAG, "AUDIO PLAYBACK COMPLETE: ring drain selesai; SESSION tetap hidup; next turn READY");
             }
         }
 
         if (received == 0) vTaskDelay(pdMS_TO_TICKS(2));
     }
+}
+
+bool gemini_audio_turn_active(void)
+{
+    return s_playback_active || s_turn_complete_pending;
 }
 
 bool gemini_audio_process_server_message(const char *json, size_t len)
