@@ -16,9 +16,6 @@
 
 static const char *TAG = "GEMINI_AUDIO";
 
-// Repo3 uses a large persistent playback ring so the WebSocket RX worker does
-// not block while Audio HAL is playing a model response. Keep that separation
-// while retaining Repo5's AudioEngine as the speaker owner.
 static constexpr size_t AUDIO_RING_BUFFER_SIZE = 512 * 1024;
 static constexpr size_t PLAYBACK_READ_SIZE = 2048;
 static constexpr size_t PLAYBACK_TRIGGER_SIZE = 1024;
@@ -36,6 +33,8 @@ static StaticSemaphore_t s_audio_mutex_storage;
 static volatile bool s_playback_active = false;
 static volatile bool s_turn_complete_pending = false;
 static bool s_logged_first_audio = false;
+
+static void playback_task(void *arg);
 
 static bool ensure_playback_pipeline(void)
 {
@@ -57,8 +56,7 @@ static bool ensure_playback_pipeline(void)
                 heap_caps_malloc(AUDIO_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (!s_audio_ring_memory) {
-            ESP_LOGE(TAG, "Gagal alokasi audio ring %u byte",
-                     (unsigned)AUDIO_RING_BUFFER_SIZE);
+            ESP_LOGE(TAG, "Gagal alokasi audio ring %u byte", (unsigned)AUDIO_RING_BUFFER_SIZE);
             return false;
         }
 
@@ -147,11 +145,8 @@ static bool process_inline_audio(cJSON *inline_data)
 
     size_t decoded_len = 0;
     const int rc = mbedtls_base64_decode(
-        pcm,
-        capacity,
-        &decoded_len,
-        reinterpret_cast<const unsigned char *>(encoded->valuestring),
-        b64_len);
+        pcm, capacity, &decoded_len,
+        reinterpret_cast<const unsigned char *>(encoded->valuestring), b64_len);
 
     if (rc != 0 || decoded_len == 0 || (decoded_len & 1U) != 0) {
         ESP_LOGW(TAG, "Decode PCM Base64 gagal: rc=%d bytes=%u", rc, (unsigned)decoded_len);
@@ -188,6 +183,7 @@ static void playback_task(void *)
 
     for (;;) {
         size_t received = 0;
+        size_t pending = 0;
 
         if (s_audio_ring && s_audio_mutex &&
             xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -196,18 +192,15 @@ static void playback_task(void *)
                 reinterpret_cast<uint8_t *>(playback_buffer),
                 sizeof(playback_buffer),
                 pdMS_TO_TICKS(5));
-            const size_t pending = xStreamBufferBytesAvailable(s_audio_ring);
+            pending = xStreamBufferBytesAvailable(s_audio_ring);
             xSemaphoreGive(s_audio_mutex);
 
             if (received > 0) {
                 received &= ~((size_t)1);
-                if (received > 0) {
-                    if (!audio_engine_write_speaker_pcm(
-                            playback_buffer,
-                            received / sizeof(int16_t),
-                            100)) {
-                        ESP_LOGW(TAG, "AudioEngine speaker queue menolak %u byte", (unsigned)received);
-                    }
+                if (received > 0 &&
+                    !audio_engine_write_speaker_pcm(
+                        playback_buffer, received / sizeof(int16_t), 100)) {
+                    ESP_LOGW(TAG, "AudioEngine speaker queue menolak %u byte", (unsigned)received);
                 }
             }
 
@@ -217,9 +210,7 @@ static void playback_task(void *)
             }
         }
 
-        if (received == 0) {
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
+        if (received == 0) vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -256,18 +247,14 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         for (int i = 0; i < count; ++i) {
             cJSON *part = cJSON_GetArrayItem(parts, i);
             if (!cJSON_IsObject(part)) continue;
-
             cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
-            if (cJSON_IsObject(inline_data) && process_inline_audio(inline_data)) {
-                handled = true;
-            }
+            if (cJSON_IsObject(inline_data) && process_inline_audio(inline_data)) handled = true;
         }
     }
 
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
-        // Do NOT stop AudioEngine or WebSocket. This is only the server-side
-        // end of the model turn; the PCM ring is allowed to drain naturally.
+        // Do NOT stop AudioEngine or WebSocket. The ring is allowed to drain.
         s_turn_complete_pending = true;
         ESP_LOGI(TAG, "TURN COMPLETE: Gemini selesai; playback drain; SESSION tetap HIDUP");
         handled = true;
