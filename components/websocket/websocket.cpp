@@ -41,7 +41,7 @@ typedef struct {
 
 static QueueHandle_t s_tx_queue = nullptr;
 static TaskHandle_t s_tx_task = nullptr;
-static volatile uint32_t s_generation = 0;
+static uint32_t s_generation = 0;
 static volatile bool s_tx_error = false;
 
 static void tx_flush_queue(void)
