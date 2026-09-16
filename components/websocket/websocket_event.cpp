@@ -1,5 +1,6 @@
 #include "websocket_event.h"
 #include "websocket_transport.h"
+#include "websocket.h"
 #include "gemini_protocol.h"
 #include "gemini_message.h"
 #include "gemini_audio.h"
@@ -14,9 +15,6 @@
 static const char *TAG = "WS_EVENT";
 static volatile bool s_gemini_ready = false;
 
-// Gemini Live responses can be larger than the WebSocket client's internal
-// event chunks. Keep complete-message storage in PSRAM so the event callback
-// does not consume a large DRAM/static buffer.
 static constexpr size_t RX_MAX_PAYLOAD = 64 * 1024;
 static constexpr size_t RX_DIAGNOSTIC_MAX = 512;
 static constexpr size_t RX_BUFFER_COUNT = 3;
@@ -154,13 +152,6 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     const size_t offset = (size_t)data->payload_offset;
     const size_t chunk_len = (size_t)data->data_len;
 
-    ESP_LOGI(TAG,
-             "Gemini RX chunk: opcode=0x%02X offset=%u len=%u total=%u",
-             data->op_code,
-             (unsigned)offset,
-             (unsigned)chunk_len,
-             (unsigned)payload_len);
-
     if (payload_len > RX_MAX_PAYLOAD ||
         offset > payload_len ||
         chunk_len > payload_len - offset) {
@@ -204,9 +195,7 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     memcpy(s_rx_assembling_buffer + offset, data->data_ptr, chunk_len);
     s_rx_received += chunk_len;
 
-    if (s_rx_received != s_rx_expected) {
-        return;
-    }
+    if (s_rx_received != s_rx_expected) return;
 
     s_rx_assembling_buffer[s_rx_expected] = '\0';
     char *ready_buffer = s_rx_assembling_buffer;
@@ -223,26 +212,6 @@ static void handle_data_event(esp_websocket_event_data_t *data)
     }
 }
 
-static void send_gemini_setup(void)
-{
-    char *setup = nullptr;
-    size_t setup_len = 0;
-
-    if (!gemini_protocol_build_setup(&setup, &setup_len)) {
-        ESP_LOGE(TAG, "Gagal membuat Gemini setup");
-        return;
-    }
-
-    const esp_err_t err = websocket_transport_send_text(setup, setup_len);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Gemini setup terkirim (%u byte)", (unsigned)setup_len);
-    } else {
-        ESP_LOGE(TAG, "Gagal mengirim Gemini setup: %s", esp_err_to_name(err));
-    }
-
-    free(setup);
-}
-
 void websocket_event_handler(void *handler_args,
                              esp_event_base_t base,
                              int32_t event_id,
@@ -252,13 +221,15 @@ void websocket_event_handler(void *handler_args,
     (void)base;
 
     websocket_transport_handle_event(event_id, event_data);
+    websocket_tx_handle_event(event_id);
 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             s_gemini_ready = false;
             reset_rx();
             ensure_rx_worker();
-            send_gemini_setup();
+            // Setup is queued for the same central TX worker that owns audio
+            // writes. No WebSocket write occurs in this callback.
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
