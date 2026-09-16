@@ -2,35 +2,125 @@
 
 #include "audio_engine.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "GEMINI_AUDIO";
-static bool s_playback_active = false;
+
+// Repo3 uses a large persistent playback ring so the WebSocket RX worker does
+// not block while Audio HAL is playing a model response. Keep that separation
+// while retaining Repo5's AudioEngine as the speaker owner.
+static constexpr size_t AUDIO_RING_BUFFER_SIZE = 512 * 1024;
+static constexpr size_t PLAYBACK_READ_SIZE = 2048;
+static constexpr size_t PLAYBACK_TRIGGER_SIZE = 1024;
+static constexpr uint32_t PLAYBACK_TASK_STACK = 4096;
+static constexpr UBaseType_t PLAYBACK_TASK_PRIORITY = 6;
+static constexpr uint32_t RING_SEND_TIMEOUT_MS = 20;
+
+static StreamBufferHandle_t s_audio_ring = nullptr;
+static StaticStreamBuffer_t s_audio_ring_struct;
+static uint8_t *s_audio_ring_memory = nullptr;
+static TaskHandle_t s_playback_task = nullptr;
+static SemaphoreHandle_t s_audio_mutex = nullptr;
+static StaticSemaphore_t s_audio_mutex_storage;
+
+static volatile bool s_playback_active = false;
+static volatile bool s_turn_complete_pending = false;
 static bool s_logged_first_audio = false;
 
-static bool write_pcm_bytes(const uint8_t *data, size_t bytes)
+static bool ensure_playback_pipeline(void)
 {
-    if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
+    if (s_audio_ring && s_playback_task && s_audio_mutex) return true;
 
-    const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
-    size_t remaining = bytes / sizeof(int16_t);
-
-    while (remaining > 0) {
-        const size_t chunk = remaining > 1024 ? 1024 : remaining;
-        if (!audio_engine_write_speaker_pcm(pcm, chunk, 100)) {
-            ESP_LOGW(TAG, "Gagal enqueue PCM speaker: samples=%u", (unsigned)chunk);
+    if (!s_audio_mutex) {
+        s_audio_mutex = xSemaphoreCreateMutexStatic(&s_audio_mutex_storage);
+        if (!s_audio_mutex) {
+            ESP_LOGE(TAG, "Gagal membuat audio mutex");
             return false;
         }
-        pcm += chunk;
-        remaining -= chunk;
+    }
+
+    if (!s_audio_ring) {
+        s_audio_ring_memory = static_cast<uint8_t *>(
+            heap_caps_malloc(AUDIO_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!s_audio_ring_memory) {
+            s_audio_ring_memory = static_cast<uint8_t *>(
+                heap_caps_malloc(AUDIO_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        if (!s_audio_ring_memory) {
+            ESP_LOGE(TAG, "Gagal alokasi audio ring %u byte",
+                     (unsigned)AUDIO_RING_BUFFER_SIZE);
+            return false;
+        }
+
+        s_audio_ring = xStreamBufferCreateStatic(
+            AUDIO_RING_BUFFER_SIZE,
+            PLAYBACK_TRIGGER_SIZE,
+            s_audio_ring_memory,
+            &s_audio_ring_struct);
+        if (!s_audio_ring) {
+            ESP_LOGE(TAG, "Gagal membuat audio stream buffer");
+            heap_caps_free(s_audio_ring_memory);
+            s_audio_ring_memory = nullptr;
+            return false;
+        }
+    }
+
+    if (!s_playback_task) {
+        if (xTaskCreate(playback_task, "gemini_playback", PLAYBACK_TASK_STACK,
+                        nullptr, PLAYBACK_TASK_PRIORITY, &s_playback_task) != pdPASS) {
+            ESP_LOGE(TAG, "Gagal membuat Gemini playback worker");
+            return false;
+        }
     }
 
     return true;
+}
+
+static void clear_audio_ring(void)
+{
+    if (!s_audio_ring || !s_audio_mutex) return;
+    if (xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        xStreamBufferReset(s_audio_ring);
+        xSemaphoreGive(s_audio_mutex);
+    }
+    s_turn_complete_pending = false;
+}
+
+static bool queue_pcm_bytes(const uint8_t *data, size_t bytes)
+{
+    if (!data || bytes == 0 || (bytes & 1U) != 0) return false;
+    if (!ensure_playback_pipeline()) return false;
+
+    if (xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGW(TAG, "Audio ring mutex timeout");
+        return false;
+    }
+
+    size_t offset = 0;
+    while (offset < bytes) {
+        const size_t chunk = (bytes - offset > 8192) ? 8192 : (bytes - offset);
+        const size_t written = xStreamBufferSend(
+            s_audio_ring, data + offset, chunk, pdMS_TO_TICKS(RING_SEND_TIMEOUT_MS));
+        offset += written;
+        if (written < chunk) {
+            ESP_LOGW(TAG, "Audio ring penuh: queued=%u/%u byte",
+                     (unsigned)offset, (unsigned)bytes);
+            break;
+        }
+    }
+
+    xSemaphoreGive(s_audio_mutex);
+    return offset == bytes;
 }
 
 static bool process_inline_audio(cJSON *inline_data)
@@ -80,13 +170,57 @@ static bool process_inline_audio(cJSON *inline_data)
     }
 
     if (!s_logged_first_audio) {
-        ESP_LOGI(TAG, "Audio Gemini diterima: %u byte PCM16", (unsigned)decoded_len);
+        ESP_LOGI(TAG, "Audio Gemini diterima: %u byte PCM16 -> ring %u byte",
+                 (unsigned)decoded_len, (unsigned)AUDIO_RING_BUFFER_SIZE);
         s_logged_first_audio = true;
     }
 
-    const bool ok = write_pcm_bytes(pcm, decoded_len);
+    const bool ok = queue_pcm_bytes(pcm, decoded_len);
     free(pcm);
     return ok;
+}
+
+static void playback_task(void *)
+{
+    static int16_t playback_buffer[PLAYBACK_READ_SIZE / sizeof(int16_t)];
+    ESP_LOGI(TAG, "Gemini playback worker START: ring=%uKB",
+             (unsigned)(AUDIO_RING_BUFFER_SIZE / 1024));
+
+    for (;;) {
+        size_t received = 0;
+
+        if (s_audio_ring && s_audio_mutex &&
+            xSemaphoreTake(s_audio_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            received = xStreamBufferReceive(
+                s_audio_ring,
+                reinterpret_cast<uint8_t *>(playback_buffer),
+                sizeof(playback_buffer),
+                pdMS_TO_TICKS(5));
+            const size_t pending = xStreamBufferBytesAvailable(s_audio_ring);
+            xSemaphoreGive(s_audio_mutex);
+
+            if (received > 0) {
+                received &= ~((size_t)1);
+                if (received > 0) {
+                    if (!audio_engine_write_speaker_pcm(
+                            playback_buffer,
+                            received / sizeof(int16_t),
+                            100)) {
+                        ESP_LOGW(TAG, "AudioEngine speaker queue menolak %u byte", (unsigned)received);
+                    }
+                }
+            }
+
+            if (s_turn_complete_pending && pending == 0 && received == 0) {
+                s_turn_complete_pending = false;
+                ESP_LOGI(TAG, "AUDIO PLAYBACK COMPLETE: ring drain selesai; SESSION tetap hidup");
+            }
+        }
+
+        if (received == 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
 }
 
 bool gemini_audio_process_server_message(const char *json, size_t len)
@@ -105,12 +239,13 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
 
     cJSON *interrupted = cJSON_GetObjectItemCaseSensitive(server_content, "interrupted");
     if (cJSON_IsTrue(interrupted)) {
+        clear_audio_ring();
         if (s_playback_active) {
             audio_engine_stop_playback();
             s_playback_active = false;
         }
         s_logged_first_audio = false;
-        ESP_LOGI(TAG, "Gemini interrupted: playback dihentikan");
+        ESP_LOGI(TAG, "Gemini interrupted: playback dihentikan dan ring dibersihkan");
         handled = true;
     }
 
@@ -129,11 +264,12 @@ bool gemini_audio_process_server_message(const char *json, size_t len)
         }
     }
 
-    // turnComplete only means Gemini has finished sending this model turn.
-    // PCM may still be queued inside AudioEngine, so do not stop I2S here.
     cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server_content, "turnComplete");
     if (cJSON_IsTrue(turn_complete)) {
-        ESP_LOGI(TAG, "Turn complete: PCM playback dibiarkan drain");
+        // Do NOT stop AudioEngine or WebSocket. This is only the server-side
+        // end of the model turn; the PCM ring is allowed to drain naturally.
+        s_turn_complete_pending = true;
+        ESP_LOGI(TAG, "TURN COMPLETE: Gemini selesai; playback drain; SESSION tetap HIDUP");
         handled = true;
     }
 
