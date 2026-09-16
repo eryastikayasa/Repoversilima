@@ -17,6 +17,7 @@ static const char *TAG = "WS_MGR";
 // Repo3 TX architecture: exactly one FreeRTOS task owns all WebSocket writes.
 // Audio producers only enqueue PCM and never call the socket directly.
 static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
+static constexpr size_t WS_TX_TEXT_SIZE = 8192;
 static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
 static constexpr size_t PCM_SEND_CHUNK = 1600;
 static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
@@ -28,6 +29,7 @@ static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 typedef enum {
     WS_TX_COMMAND_SETUP = 1,
     WS_TX_COMMAND_AUDIO = 2,
+    WS_TX_COMMAND_TEXT = 3,
 } ws_tx_command_type_t;
 
 typedef struct {
@@ -74,6 +76,21 @@ static bool tx_state_valid(uint32_t generation)
            websocket_transport_is_connected();
 }
 
+static bool send_text_checked(esp_websocket_client_handle_t ws,
+                              const char *text,
+                              size_t len,
+                              TickType_t timeout,
+                              uint32_t generation)
+{
+    if (!ws || !text || len == 0 || len > WS_TX_TEXT_SIZE) return false;
+    if (!tx_state_valid(generation) || websocket_transport_get_client() != ws ||
+        !esp_websocket_client_is_connected(ws)) return false;
+
+    const int sent = esp_websocket_client_send_text(
+        ws, text, (int)len, timeout);
+    return sent == (int)len;
+}
+
 static void websocket_tx_task(void *)
 {
     ws_tx_command_t cmd{};
@@ -117,26 +134,37 @@ static void websocket_tx_task(void *)
                 continue;
             }
 
-            if (!tx_state_valid(cmd.generation) ||
-                websocket_transport_get_client() != ws ||
-                !esp_websocket_client_is_connected(ws)) {
-                free(setup);
+            const bool sent_ok = send_text_checked(
+                ws, setup, setup_len, pdMS_TO_TICKS(3000), cmd.generation);
+            if (!sent_ok) {
+                ESP_LOGW(TAG, "Gemini setup write gagal");
+                tx_fail();
+            } else {
+                ESP_LOGI(TAG, "Gemini setup terkirim: %u byte generation=%lu",
+                         (unsigned)setup_len,
+                         (unsigned long)cmd.generation);
+            }
+
+            free(setup);
+            free(data);
+            continue;
+        }
+
+        if (cmd.type == WS_TX_COMMAND_TEXT) {
+            if (!data || cmd.len == 0 || cmd.len > WS_TX_TEXT_SIZE) {
                 free(data);
                 continue;
             }
 
-            const int sent = esp_websocket_client_send_text(
-                ws, setup, (int)setup_len, pdMS_TO_TICKS(5000));
-            if (sent != (int)setup_len) {
-                ESP_LOGW(TAG, "Gemini setup write gagal: sent=%d expected=%u",
-                         sent, (unsigned)setup_len);
+            if (!send_text_checked(ws,
+                                   reinterpret_cast<const char *>(data),
+                                   cmd.len,
+                                   pdMS_TO_TICKS(3000),
+                                   cmd.generation)) {
+                ESP_LOGW(TAG, "TX text write gagal: len=%u", (unsigned)cmd.len);
                 tx_fail();
-            } else {
-                ESP_LOGI(TAG, "Gemini setup terkirim: %d byte generation=%lu",
-                         sent, (unsigned long)cmd.generation);
             }
 
-            free(setup);
             free(data);
             continue;
         }
@@ -319,22 +347,22 @@ bool websocket_is_connected(void)
 
 esp_err_t websocket_send_text(const char *text, size_t len)
 {
-    // Compatibility API: route text through the same central TX worker.
-    // The caller must not depend on synchronous socket completion.
-    if (!text || len == 0 || len > 8192 || !websocket_transport_is_connected()) {
+    if (!text || len == 0 || len > WS_TX_TEXT_SIZE ||
+        !websocket_transport_is_connected()) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    char *copy = static_cast<char *>(malloc(len + 1));
+    char *copy = static_cast<char *>(malloc(len));
     if (!copy) return ESP_ERR_NO_MEM;
     memcpy(copy, text, len);
-    copy[len] = '\0';
 
-    // Only the central worker may write. Compatibility text is represented as
-    // a setup-style raw payload by sending it immediately through the queue.
-    // Current Gemini paths use websocket_tx_enqueue_audio / setup scheduling.
-    free(copy);
-    return ESP_ERR_NOT_SUPPORTED;
+    ws_tx_command_t cmd{};
+    cmd.type = WS_TX_COMMAND_TEXT;
+    cmd.generation = s_generation;
+    cmd.len = static_cast<uint16_t>(len);
+    cmd.data = reinterpret_cast<uint8_t *>(copy);
+
+    return enqueue_command(&cmd) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t websocket_send_binary(const uint8_t *data, size_t len)
