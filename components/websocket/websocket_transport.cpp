@@ -126,6 +126,11 @@ bool websocket_transport_is_connected(void)
     return esp_websocket_client_is_connected(s_client);
 }
 
+esp_websocket_client_handle_t websocket_transport_get_client(void)
+{
+    return s_client;
+}
+
 esp_err_t websocket_transport_send_text(const char *text, size_t len)
 {
     if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
