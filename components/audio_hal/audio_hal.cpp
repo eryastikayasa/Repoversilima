@@ -23,10 +23,8 @@ static bool s_initialized = false;
 static bool s_capture_started = false;
 static bool s_playback_started = false;
 
-// Keep the temporary I2S conversion buffers out of task stacks.
-// 1024 x 32-bit = 4096 bytes each.
 static int32_t s_rx_raw[1024];
-static int32_t s_tx_raw[1024];
+static int32_t s_tx_raw[512];
 
 void audio_hal_init(void)
 {
@@ -65,6 +63,9 @@ void audio_hal_init(void)
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
     tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
         I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
+    tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
     tx_cfg.slot_cfg.ws_pol = false;
     tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
@@ -113,7 +114,6 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
 
     size_t bytes_read = 0;
     const size_t input_bytes = samples * sizeof(int32_t);
-
     esp_err_t err = i2s_channel_read(
         s_rx, s_rx_raw, input_bytes, &bytes_read, portMAX_DELAY);
     if (err != ESP_OK) return err;
@@ -159,39 +159,40 @@ esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *sam
     if (!s_playback_started || !s_tx) return ESP_ERR_INVALID_STATE;
     if (samples > 1024) return ESP_ERR_INVALID_SIZE;
 
-    // Speaker I2S is configured as 32-bit. Expand PCM16 to the 32-bit
-    // left-justified representation used by the proven Repo4 path.
-    for (size_t i = 0; i < samples; ++i) {
-        s_tx_raw[i] = ((int32_t)buffer[i]) << 16;
+    // Match the proven Repo3 speaker path: bounded 512-sample I2S writes,
+    // 32-bit LEFT PCM conversion, and an explicit scheduler yield.
+    constexpr size_t I2S_WRITE_SAMPLES = 512;
+    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
+    const size_t n = samples > I2S_WRITE_SAMPLES ? I2S_WRITE_SAMPLES : samples;
+
+    for (size_t i = 0; i < n; ++i) {
+        s_tx_raw[i] = static_cast<int32_t>(buffer[i]) << 16;
     }
 
-    // The I2S driver can return a partial write when the DMA ring becomes
-    // available only in smaller pieces. Do not drop the unwritten PCM.
-    size_t total_written = 0;
-    while (total_written < samples) {
-        size_t bytes_written = 0;
-        const size_t remaining_bytes = (samples - total_written) * sizeof(int32_t);
-        const esp_err_t err = i2s_channel_write(
-            s_tx,
-            s_tx_raw + total_written,
-            remaining_bytes,
-            &bytes_written,
-            pdMS_TO_TICKS(100));
+    size_t bytes_written = 0;
+    const esp_err_t err = i2s_channel_write(
+        s_tx,
+        s_tx_raw,
+        n * sizeof(int32_t),
+        &bytes_written,
+        I2S_WRITE_TIMEOUT_MS);
 
-        const size_t chunk_written = bytes_written / sizeof(int32_t);
-        total_written += chunk_written;
+    size_t written = bytes_written / sizeof(int32_t);
+    if (written > n) written = n;
+    *samples_written = written;
 
-        if (err != ESP_OK) {
-            *samples_written = total_written;
-            return err;
-        }
-
-        if (chunk_written == 0) {
-            *samples_written = total_written;
-            return ESP_ERR_TIMEOUT;
-        }
+    if (err != ESP_OK || written == 0) {
+        ESP_LOGW(TAG,
+                 "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
+                 esp_err_to_name(err),
+                 (unsigned)bytes_written,
+                 (unsigned)(n * sizeof(int32_t)),
+                 (unsigned)I2S_WRITE_TIMEOUT_MS);
+        vTaskDelay(1);
+        return err != ESP_OK ? err : ESP_ERR_TIMEOUT;
     }
 
-    *samples_written = total_written;
-    return ESP_OK;
+    // Do not let a long sequence of successful DMA writes monopolize the CPU.
+    vTaskDelay(1);
+    return err;
 }
