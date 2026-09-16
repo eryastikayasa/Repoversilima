@@ -1,32 +1,409 @@
 #include "websocket.h"
 #include "websocket_transport.h"
+#include "websocket_event.h"
+#include "gemini_protocol.h"
+#include "esp_log.h"
+#include "esp_websocket_client.h"
+#include "mbedtls/base64.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+static const char *TAG = "WS_MGR";
+
+// Repo3 TX architecture: exactly one FreeRTOS task owns all WebSocket writes.
+// Audio producers only enqueue PCM and never call the socket directly.
+static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
+static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
+static constexpr size_t PCM_SEND_CHUNK = 1600;
+static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
+static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
+static constexpr int AUDIO_SEND_RETRIES = 1;
+static constexpr uint32_t TX_TASK_STACK = 8192;
+static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
+
+typedef enum {
+    WS_TX_COMMAND_SETUP = 1,
+    WS_TX_COMMAND_AUDIO = 2,
+} ws_tx_command_type_t;
+
+typedef struct {
+    ws_tx_command_type_t type;
+    uint32_t generation;
+    uint16_t len;
+    uint8_t *data;
+} ws_tx_command_t;
+
+static QueueHandle_t s_tx_queue = nullptr;
+static TaskHandle_t s_tx_task = nullptr;
+static volatile uint32_t s_generation = 0;
+static volatile bool s_tx_error = false;
+
+static void tx_flush_queue(void)
+{
+    if (!s_tx_queue) return;
+
+    ws_tx_command_t stale{};
+    size_t flushed = 0;
+    while (xQueueReceive(s_tx_queue, &stale, 0) == pdTRUE) {
+        free(stale.data);
+        stale = {};
+        ++flushed;
+    }
+
+    if (flushed) {
+        ESP_LOGW(TAG, "TX queue dibersihkan: %u command", (unsigned)flushed);
+    }
+}
+
+static void tx_fail(void)
+{
+    s_tx_error = true;
+    s_generation++;
+    tx_flush_queue();
+    ESP_LOGW(TAG, "TX failure: generation=%lu", (unsigned long)s_generation);
+}
+
+static bool tx_state_valid(uint32_t generation)
+{
+    return generation == s_generation &&
+           !s_tx_error &&
+           websocket_transport_is_connected();
+}
+
+static void websocket_tx_task(void *)
+{
+    ws_tx_command_t cmd{};
+    static char b64_buf[2300];
+    static char json_buf[2500];
+
+    ESP_LOGI(TAG,
+             "Central TX worker START: queue=%u chunk=%u timeout=3000ms retry=1",
+             (unsigned)WS_TX_QUEUE_LENGTH,
+             (unsigned)PCM_SEND_CHUNK);
+
+    for (;;) {
+        if (xQueueReceive(s_tx_queue, &cmd, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint8_t *data = cmd.data;
+        cmd.data = nullptr;
+
+        if (!tx_state_valid(cmd.generation)) {
+            ESP_LOGD(TAG, "Stale TX command dibuang: generation=%lu current=%lu",
+                     (unsigned long)cmd.generation,
+                     (unsigned long)s_generation);
+            free(data);
+            continue;
+        }
+
+        esp_websocket_client_handle_t ws = websocket_transport_get_client();
+        if (!ws || !esp_websocket_client_is_connected(ws)) {
+            free(data);
+            continue;
+        }
+
+        if (cmd.type == WS_TX_COMMAND_SETUP) {
+            char *setup = nullptr;
+            size_t setup_len = 0;
+
+            if (!gemini_protocol_build_setup(&setup, &setup_len)) {
+                ESP_LOGE(TAG, "Gagal membuat Gemini setup");
+                free(data);
+                continue;
+            }
+
+            if (!tx_state_valid(cmd.generation) ||
+                websocket_transport_get_client() != ws ||
+                !esp_websocket_client_is_connected(ws)) {
+                free(setup);
+                free(data);
+                continue;
+            }
+
+            const int sent = esp_websocket_client_send_text(
+                ws, setup, (int)setup_len, pdMS_TO_TICKS(5000));
+            if (sent != (int)setup_len) {
+                ESP_LOGW(TAG, "Gemini setup write gagal: sent=%d expected=%u",
+                         sent, (unsigned)setup_len);
+                tx_fail();
+            } else {
+                ESP_LOGI(TAG, "Gemini setup terkirim: %d byte generation=%lu",
+                         sent, (unsigned long)cmd.generation);
+            }
+
+            free(setup);
+            free(data);
+            continue;
+        }
+
+        if (cmd.type == WS_TX_COMMAND_AUDIO) {
+            if (!data || cmd.len == 0 || cmd.len > WS_TX_AUDIO_SIZE) {
+                free(data);
+                continue;
+            }
+
+            size_t offset = 0;
+            bool failed = false;
+
+            while (offset < cmd.len) {
+                if (!tx_state_valid(cmd.generation) ||
+                    websocket_transport_get_client() != ws ||
+                    !esp_websocket_client_is_connected(ws)) {
+                    failed = true;
+                    break;
+                }
+
+                size_t chunk_len = cmd.len - offset;
+                if (chunk_len > PCM_SEND_CHUNK) chunk_len = PCM_SEND_CHUNK;
+
+                size_t encoded_len = 0;
+                const int b64_ret = mbedtls_base64_encode(
+                    reinterpret_cast<unsigned char *>(b64_buf),
+                    sizeof(b64_buf) - 1,
+                    &encoded_len,
+                    data + offset,
+                    chunk_len);
+                if (b64_ret != 0) {
+                    ESP_LOGW(TAG, "TX audio base64 gagal: ret=%d chunk=%u",
+                             b64_ret, (unsigned)chunk_len);
+                    failed = true;
+                    break;
+                }
+                b64_buf[encoded_len] = '\0';
+
+                const int json_len = snprintf(
+                    json_buf,
+                    sizeof(json_buf),
+                    "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
+                    b64_buf);
+                if (json_len < 0 || (size_t)json_len >= sizeof(json_buf)) {
+                    ESP_LOGW(TAG, "TX audio JSON terlalu besar: chunk=%u",
+                             (unsigned)chunk_len);
+                    failed = true;
+                    break;
+                }
+
+                bool chunk_sent = false;
+                for (int attempt = 0; attempt <= AUDIO_SEND_RETRIES; ++attempt) {
+                    if (!tx_state_valid(cmd.generation) ||
+                        websocket_transport_get_client() != ws ||
+                        !esp_websocket_client_is_connected(ws)) {
+                        break;
+                    }
+
+                    if (attempt > 0) {
+                        vTaskDelay(AUDIO_SEND_RETRY_DELAY);
+                        if (!tx_state_valid(cmd.generation) ||
+                            websocket_transport_get_client() != ws ||
+                            !esp_websocket_client_is_connected(ws)) {
+                            break;
+                        }
+                    }
+
+                    const int sent = esp_websocket_client_send_text(
+                        ws, json_buf, json_len, AUDIO_SEND_TIMEOUT);
+                    if (sent == json_len) {
+                        chunk_sent = true;
+                        break;
+                    }
+
+                    ESP_LOGW(TAG,
+                             "TX audio write timeout/fail: attempt=%d sent=%d expected=%d pcm_chunk=%u offset=%u/%u",
+                             attempt + 1,
+                             sent,
+                             json_len,
+                             (unsigned)chunk_len,
+                             (unsigned)offset,
+                             (unsigned)cmd.len);
+                }
+
+                if (!chunk_sent) {
+                    failed = true;
+                    break;
+                }
+
+                offset += chunk_len;
+            }
+
+            if (failed) {
+                ESP_LOGW(TAG,
+                         "TX audio command dihentikan: sent_pcm=%u/%u generation=%lu",
+                         (unsigned)offset,
+                         (unsigned)cmd.len,
+                         (unsigned long)cmd.generation);
+                tx_fail();
+            }
+
+            free(data);
+            continue;
+        }
+
+        free(data);
+    }
+}
+
+static bool ensure_tx_worker(void)
+{
+    if (s_tx_task) return true;
+
+    if (!s_tx_queue) {
+        s_tx_queue = xQueueCreate(WS_TX_QUEUE_LENGTH, sizeof(ws_tx_command_t));
+        if (!s_tx_queue) {
+            ESP_LOGE(TAG, "Gagal membuat central TX queue");
+            return false;
+        }
+    }
+
+    if (xTaskCreate(websocket_tx_task,
+                    "ws_tx",
+                    TX_TASK_STACK,
+                    nullptr,
+                    TX_TASK_PRIORITY,
+                    &s_tx_task) != pdPASS) {
+        ESP_LOGE(TAG, "Gagal membuat central TX worker");
+        return false;
+    }
+
+    return true;
+}
+
+static bool enqueue_command(ws_tx_command_t *cmd)
+{
+    if (!cmd || !s_tx_queue) return false;
+    if (xQueueSend(s_tx_queue, cmd, 0) == pdTRUE) return true;
+
+    ws_tx_command_t stale{};
+    if (xQueueReceive(s_tx_queue, &stale, 0) == pdTRUE) {
+        ESP_LOGW(TAG, "TX queue penuh: stale command generation=%lu dibuang",
+                 (unsigned long)stale.generation);
+        free(stale.data);
+        if (xQueueSend(s_tx_queue, cmd, 0) == pdTRUE) return true;
+    }
+
+    free(cmd->data);
+    cmd->data = nullptr;
+    return false;
+}
 
 esp_err_t websocket_init(void)
 {
-    return websocket_transport_init();
+    const esp_err_t err = websocket_transport_init();
+    if (err != ESP_OK) return err;
+    return ensure_tx_worker() ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t websocket_connect(void)
 {
+    if (!ensure_tx_worker()) return ESP_FAIL;
     return websocket_transport_connect();
 }
 
 esp_err_t websocket_disconnect(void)
 {
+    s_tx_error = true;
+    s_generation++;
+    tx_flush_queue();
     return websocket_transport_disconnect();
 }
 
 bool websocket_is_connected(void)
 {
-    return websocket_transport_is_connected();
+    return !s_tx_error && websocket_transport_is_connected() &&
+           websocket_event_gemini_ready();
 }
 
 esp_err_t websocket_send_text(const char *text, size_t len)
 {
-    return websocket_transport_send_text(text, len);
+    // Compatibility API: route text through the same central TX worker.
+    // The caller must not depend on synchronous socket completion.
+    if (!text || len == 0 || len > 8192 || !websocket_transport_is_connected()) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char *copy = static_cast<char *>(malloc(len + 1));
+    if (!copy) return ESP_ERR_NO_MEM;
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+
+    // Only the central worker may write. Compatibility text is represented as
+    // a setup-style raw payload by sending it immediately through the queue.
+    // Current Gemini paths use websocket_tx_enqueue_audio / setup scheduling.
+    free(copy);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t websocket_send_binary(const uint8_t *data, size_t len)
 {
-    return websocket_transport_send_binary(data, len);
+    (void)data;
+    (void)len;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0 || len > WS_TX_AUDIO_SIZE ||
+        !websocket_is_connected()) {
+        return false;
+    }
+
+    uint8_t *copy = static_cast<uint8_t *>(malloc(len));
+    if (!copy) return false;
+    memcpy(copy, data, len);
+
+    ws_tx_command_t cmd{};
+    cmd.type = WS_TX_COMMAND_AUDIO;
+    cmd.generation = s_generation;
+    cmd.len = static_cast<uint16_t>(len);
+    cmd.data = copy;
+
+    return enqueue_command(&cmd);
+}
+
+void websocket_tx_schedule_setup(void)
+{
+    if (!ensure_tx_worker() || !websocket_transport_is_connected() || s_tx_error) return;
+
+    ws_tx_command_t cmd{};
+    cmd.type = WS_TX_COMMAND_SETUP;
+    cmd.generation = s_generation;
+    cmd.len = 0;
+    cmd.data = nullptr;
+    (void)enqueue_command(&cmd);
+}
+
+void websocket_tx_handle_event(int32_t event_id)
+{
+    switch (event_id) {
+        case WEBSOCKET_EVENT_CONNECTED:
+            if (!ensure_tx_worker()) return;
+            s_generation++;
+            s_tx_error = false;
+            tx_flush_queue();
+            ESP_LOGI(TAG, "WebSocket TX generation baru: %lu",
+                     (unsigned long)s_generation);
+            websocket_tx_schedule_setup();
+            break;
+
+        case WEBSOCKET_EVENT_DISCONNECTED:
+        case WEBSOCKET_EVENT_ERROR:
+            s_generation++;
+            s_tx_error = true;
+            tx_flush_queue();
+            ESP_LOGW(TAG, "WebSocket TX invalidated: generation=%lu",
+                     (unsigned long)s_generation);
+            break;
+
+        default:
+            break;
+    }
+}
+
+uint32_t websocket_tx_generation(void)
+{
+    return s_generation;
 }
