@@ -1,6 +1,7 @@
 #include "websocket_audio.h"
 #include "websocket.h"
 #include "websocket_event.h"
+#include "gemini/gemini_audio.h"
 #include "audio_engine.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -13,14 +14,32 @@ static const char *TAG = "WS_AUDIO";
 // AudioEngine contract: 20 ms = 320 samples @ 16 kHz PCM16 mono.
 static constexpr size_t FRAME_SAMPLES = 320;
 static constexpr size_t FRAME_BYTES = FRAME_SAMPLES * sizeof(int16_t);
-// Match Repo3 producer contract: buffer 5 x 20 ms = 100 ms / 3200 bytes.
+// Match Repo3 producer contract: 5 x 20 ms = 100 ms / 3200 bytes.
 static constexpr size_t FRAMES_PER_BUFFER = 5;
 static constexpr size_t TX_BUFFER_BYTES = FRAME_BYTES * FRAMES_PER_BUFFER;
 static constexpr uint32_t TASK_STACK = 6144;
 static constexpr UBaseType_t TASK_PRIORITY = 5;
+static constexpr int32_t SILENCE_THRESHOLD = 500;
+static constexpr size_t MIN_ACTIVE_SAMPLES = 8;
 
 static TaskHandle_t s_task = nullptr;
 static volatile bool s_running = false;
+
+static bool mic_buffer_has_activity(const int16_t *pcm, size_t samples)
+{
+    if (!pcm || samples == 0) return false;
+
+    size_t active_samples = 0;
+    for (size_t i = 0; i < samples; ++i) {
+        const int32_t sample = pcm[i];
+        const int32_t magnitude = sample < 0 ? -sample : sample;
+        if (magnitude >= SILENCE_THRESHOLD) {
+            ++active_samples;
+            if (active_samples >= MIN_ACTIVE_SAMPLES) return true;
+        }
+    }
+    return false;
+}
 
 static void websocket_audio_task(void *)
 {
@@ -41,8 +60,8 @@ static void websocket_audio_task(void *)
             continue;
         }
 
-        // This is the only MIC-side blocking operation. No socket write,
-        // Base64, JSON construction, or network timeout occurs in this task.
+        // Exactly one blocking point: receive an already-captured 20 ms frame
+        // from AudioEngine. No WebSocket/TLS/JSON/Base64 operation happens here.
         if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, 100)) {
             continue;
         }
@@ -53,6 +72,26 @@ static void websocket_audio_task(void *)
         ++frames_collected;
 
         if (frames_collected < FRAMES_PER_BUFFER) continue;
+
+        // Repo3 does not uplink microphone audio while Gemini is speaking.
+        // This prevents echo/silence from competing with the central TX worker
+        // and preserves the same turn ownership semantics.
+        if (gemini_audio_turn_active()) {
+            frames_collected = 0;
+            continue;
+        }
+
+        // Match Repo3's MIC TX gate: do not continuously enqueue silence.
+        if (!mic_buffer_has_activity(tx_pcm, TX_BUFFER_BYTES / sizeof(int16_t))) {
+            static uint32_t silent_drops = 0;
+            ++silent_drops;
+            if ((silent_drops & 0x3FU) == 1U) {
+                ESP_LOGI(TAG, "MIC TX gate: silent 100ms buffer dropped total=%lu",
+                         (unsigned long)silent_drops);
+            }
+            frames_collected = 0;
+            continue;
+        }
 
         const bool queued = websocket_tx_enqueue_audio(
             reinterpret_cast<const uint8_t *>(tx_pcm),
