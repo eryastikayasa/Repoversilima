@@ -16,6 +16,13 @@ bool websocket_is_connected(void);
 esp_err_t websocket_send_text(const char *text, size_t len);
 esp_err_t websocket_send_binary(const uint8_t *data, size_t len);
 
+// Central Gemini audio TX path. Producers enqueue PCM only; the central
+// websocket TX worker owns the socket write and enforces generation guards.
+bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len);
+void websocket_tx_schedule_setup(void);
+void websocket_tx_handle_event(int32_t event_id);
+uint32_t websocket_tx_generation(void);
+
 bool websocket_audio_start(void);
 void websocket_audio_stop(void);
 bool websocket_audio_running(void);
