@@ -305,11 +305,21 @@ static bool enqueue_command(ws_tx_command_t *cmd)
     if (!cmd || !s_tx_queue) return false;
     if (xQueueSend(s_tx_queue, cmd, 0) == pdTRUE) return true;
 
-    ws_tx_command_t stale{};
-    if (xQueueReceive(s_tx_queue, &stale, 0) == pdTRUE) {
-        ESP_LOGW(TAG, "TX queue penuh: stale command generation=%lu dibuang",
-                 (unsigned long)stale.generation);
-        free(stale.data);
+    ws_tx_command_t evicted{};
+    if (xQueueReceive(s_tx_queue, &evicted, 0) == pdTRUE) {
+        const bool evicted_is_stale = evicted.generation != s_generation;
+        if (evicted_is_stale) {
+            ESP_LOGW(TAG, "TX queue penuh: stale command dibuang generation=%lu current=%lu",
+                     (unsigned long)evicted.generation,
+                     (unsigned long)s_generation);
+        } else {
+            // Queue pressure is not lifecycle invalidation. A same-generation
+            // command is still valid; this is an explicit oldest-item overflow
+            // policy copied from Repo3, not a stale-generation discard.
+            ESP_LOGW(TAG, "TX queue penuh: oldest VALID command dievakuasi generation=%lu",
+                     (unsigned long)evicted.generation);
+        }
+        free(evicted.data);
         if (xQueueSend(s_tx_queue, cmd, 0) == pdTRUE) return true;
     }
 
