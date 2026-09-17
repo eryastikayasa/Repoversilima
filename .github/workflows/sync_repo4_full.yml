@@ -17,23 +17,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Replace entire repository with Repo4 main
+      - name: Replace repository contents with Repo4 main
         run: |
           set -euo pipefail
           rm -rf /tmp/repo4
           git clone --depth 1 --branch main https://github.com/eryastikayasa/Repoversiempat.git /tmp/repo4
           rm -rf /tmp/repo4/.git
-          rsync -a --delete --exclude='.git/' /tmp/repo4/ ./
+          rsync -a --delete --exclude='.git/' --exclude='.github/' /tmp/repo4/ ./
 
-      - name: Commit exact mirror to Repo5 main
+      - name: Commit exact repository mirror except workflow directory
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "Repo5 already matches Repo4 main"
+            echo "Repo5 non-workflow contents already match Repo4 main"
             exit 0
           fi
-          git commit -m "sync: make Repo5 identical to Repo4 main"
+          git commit -m "sync: mirror Repo4 main contents"
           git push origin HEAD:main
