@@ -6,11 +6,33 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Sync Display from Repo4
+        if: ${{ !contains(github.event.head_commit.message, 'sync display from Repo4') }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/repo4"
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/eryastikayasa/Repoversiempat.git "$RUNNER_TEMP/repo4"
+          git -C "$RUNNER_TEMP/repo4" sparse-checkout set components/display
+          rm -rf components/display
+          cp -a "$RUNNER_TEMP/repo4/components/display" components/display
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components/display
+          if git diff --cached --quiet; then
+            echo "Display already matches Repo4"
+          else
+            git commit -m "display: sync display from Repo4"
+            git push origin HEAD:main
+          fi
 
       - uses: actions/setup-python@v5
         with:
