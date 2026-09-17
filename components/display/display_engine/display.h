@@ -33,7 +33,7 @@ static inline void face_show_for_ms(face_state_t state, uint32_t duration_ms)
 
 static inline void display_status(const char *text)
 {
-    display_set_system_state(FACE_IDLE, text ? text : "");
+    display_text_set_status(text ? text : "");
 }
 
 #ifdef __cplusplus
