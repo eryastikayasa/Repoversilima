@@ -37,7 +37,7 @@ void display_face_render_mochi(int expr, int step,
                                int sX, int sY, int arahLirik);
 void display_face_render(void);
 
-// Read-only framebuffer for the Display Engine.
+// Read-only framebuffer for the future Display Engine.
 const uint8_t *display_face_buffer(void);
 
 #ifdef __cplusplus
