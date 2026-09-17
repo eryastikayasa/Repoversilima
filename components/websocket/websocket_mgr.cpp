@@ -267,6 +267,8 @@ void websocket_disconnect(void)
 {
     /* Called by audio/main task, never from websocket event callback. */
     if (client != NULL) {
+        clear_session_handle();
+        ESP_LOGI(TAG, "Gemini session handle dihapus: sesi berikutnya akan fresh");
         esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
     }
 }
