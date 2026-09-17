@@ -21,14 +21,6 @@ static constexpr size_t MIC_FRAME_BYTES = MIC_FRAME_SAMPLES * sizeof(int16_t);
 static constexpr size_t MIC_QUEUE_DEPTH = 8;
 static constexpr uint32_t CONVERSATION_TASK_STACK = 4096;
 
-// Speaker output is decoupled from the WebSocket event callback. I2S TX is
-// realtime and may wait for DMA/speaker consumption, so WebSocket must never
-// block on the speaker path.
-static constexpr size_t PLAYBACK_BLOCK_SAMPLES = 1024;
-static constexpr size_t PLAYBACK_BLOCK_BYTES = PLAYBACK_BLOCK_SAMPLES * sizeof(int16_t);
-static constexpr size_t PLAYBACK_QUEUE_DEPTH = 12;
-static constexpr uint32_t PLAYBACK_TASK_STACK = 4096;
-
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
 static TaskHandle_t s_wakeword_task = nullptr;
 static bool s_initialized = false;
@@ -41,12 +33,7 @@ static StaticQueue_t s_mic_queue_storage;
 static uint8_t s_mic_queue_buffer[MIC_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_mic_queue = nullptr;
 
-static TaskHandle_t s_playback_task = nullptr;
 static volatile bool s_playback_running = false;
-static StaticQueue_t s_playback_queue_storage;
-static uint8_t s_playback_queue_buffer[PLAYBACK_QUEUE_DEPTH][PLAYBACK_BLOCK_BYTES];
-static QueueHandle_t s_playback_queue = nullptr;
-static uint8_t s_playback_enqueue_block[PLAYBACK_BLOCK_BYTES];
 
 static void wakeword_task(void *)
 {
@@ -108,9 +95,7 @@ static void conversation_task(void *)
             frame_pos += copy_len;
             offset += copy_len;
 
-            if (frame_pos != MIC_FRAME_BYTES) {
-                continue;
-            }
+            if (frame_pos != MIC_FRAME_BYTES) continue;
 
             frame_pos = 0;
             if (xQueueSend(s_mic_queue, frame_buffer, 0) != pdTRUE) {
@@ -129,44 +114,6 @@ static void conversation_task(void *)
 
     s_conversation_task = nullptr;
     ESP_LOGI(TAG, "Conversation MIC owner STOP");
-    vTaskDelete(nullptr);
-}
-
-static void playback_task(void *)
-{
-    static int16_t playback_buffer[PLAYBACK_BLOCK_SAMPLES];
-
-    ESP_LOGI(TAG,
-             "Speaker playback task START: 24kHz PCM16, block=%u samples, queue=%u",
-             (unsigned)PLAYBACK_BLOCK_SAMPLES,
-             (unsigned)PLAYBACK_QUEUE_DEPTH);
-
-    while (s_playback_running) {
-        if (xQueueReceive(s_playback_queue,
-                          playback_buffer,
-                          pdMS_TO_TICKS(20)) != pdTRUE) {
-            continue;
-        }
-
-        if (!s_playback_running) break;
-
-        size_t samples_written = 0;
-        const esp_err_t err = audio_hal_write_pcm(
-            playback_buffer,
-            PLAYBACK_BLOCK_SAMPLES,
-            &samples_written);
-
-        if (err != ESP_OK || samples_written != PLAYBACK_BLOCK_SAMPLES) {
-            ESP_LOGW(TAG,
-                     "Speaker PCM write tidak lengkap: requested=%u written=%u err=%s",
-                     (unsigned)PLAYBACK_BLOCK_SAMPLES,
-                     (unsigned)samples_written,
-                     esp_err_to_name(err));
-        }
-    }
-
-    s_playback_task = nullptr;
-    ESP_LOGI(TAG, "Speaker playback task STOP");
     vTaskDelete(nullptr);
 }
 
@@ -196,7 +143,10 @@ extern "C" bool audio_engine_init(void)
     if (s_initialized) return true;
 
     ESP_LOGI(TAG, "Initializing AudioEngine");
-    audio_hal_init();
+    if (audio_hal_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Audio HAL initialization failed");
+        return false;
+    }
 
     if (!wakeword_init()) {
         ESP_LOGE(TAG, "WakeWord initialization failed");
@@ -221,24 +171,12 @@ extern "C" bool audio_engine_init(void)
         return false;
     }
 
-    s_playback_queue = xQueueCreateStatic(
-        PLAYBACK_QUEUE_DEPTH,
-        PLAYBACK_BLOCK_BYTES,
-        &s_playback_queue_buffer[0][0],
-        &s_playback_queue_storage);
-    if (!s_playback_queue) {
-        ESP_LOGE(TAG, "Gagal membuat speaker playback queue");
-        wakeword_deinit();
-        return false;
-    }
-
     s_wakeword_detected = false;
     s_wakeword_running = false;
     s_wakeword_task = nullptr;
     s_conversation_running = false;
     s_conversation_task = nullptr;
     s_playback_running = false;
-    s_playback_task = nullptr;
     s_initialized = true;
 
     ESP_LOGI(TAG, "AudioEngine ready: MIC -> Audio HAL -> WakeNet");
@@ -282,9 +220,9 @@ extern "C" bool audio_engine_start_wakeword(void)
 
 extern "C" void audio_engine_stop_wakeword(void)
 {
-    if (!s_wakeword_running) return;
+    if (!s_wakeword_running && s_wakeword_task == nullptr) return;
     s_wakeword_running = false;
-    audio_hal_stop_capture();
+    (void)audio_hal_stop_capture();
     ESP_LOGI(TAG, "WakeWord capture STOP");
 }
 
@@ -420,40 +358,16 @@ extern "C" bool audio_engine_start_playback(void)
         return false;
     }
 
-    xQueueReset(s_playback_queue);
     s_playback_running = true;
-
-    const BaseType_t result = xTaskCreate(
-        playback_task,
-        "audio_playback",
-        PLAYBACK_TASK_STACK,
-        nullptr,
-        5,
-        &s_playback_task);
-
-    if (result != pdPASS) {
-        s_playback_running = false;
-        audio_hal_stop_playback();
-        s_playback_task = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat speaker playback task");
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Speaker playback START: AudioEngine owns SPK");
+    ESP_LOGI(TAG, "Speaker playback START: direct Audio HAL writer");
     return true;
 }
 
 extern "C" void audio_engine_stop_playback(void)
 {
-    if (!s_playback_running && s_playback_task == nullptr) return;
+    if (!s_playback_running) return;
 
     s_playback_running = false;
-    xQueueReset(s_playback_queue);
-
-    for (uint32_t i = 0; i < 100 && s_playback_task != nullptr; ++i) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
     const esp_err_t err = audio_hal_stop_playback();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Speaker playback STOP gagal: %s", esp_err_to_name(err));
@@ -472,37 +386,46 @@ extern "C" bool audio_engine_write_speaker_pcm(
     size_t samples,
     uint32_t timeout_ms)
 {
-    (void)timeout_ms;
-
-    if (!buffer || samples == 0 || !s_playback_running || !s_playback_queue) {
-        return false;
-    }
+    if (!buffer || samples == 0 || !s_playback_running) return false;
 
     size_t offset = 0;
-    while (offset < samples) {
-        const size_t chunk = (samples - offset) > PLAYBACK_BLOCK_SAMPLES
-                           ? PLAYBACK_BLOCK_SAMPLES
+    while (offset < samples && s_playback_running) {
+        const size_t chunk = (samples - offset) > PCM_BLOCK_SAMPLES
+                           ? PCM_BLOCK_SAMPLES
                            : (samples - offset);
 
-        // Static storage keeps the 2 KB queue element off the WebSocket/event
-        // task stack. The current WebSocket event path is serialized.
-        memcpy(s_playback_enqueue_block,
-               buffer + offset,
-               chunk * sizeof(int16_t));
+        size_t written = 0;
+        const esp_err_t err = audio_hal_write_pcm(
+            buffer + offset,
+            chunk,
+            &written);
 
-        if (chunk < PLAYBACK_BLOCK_SAMPLES) {
-            memset(s_playback_enqueue_block + chunk * sizeof(int16_t),
-                   0,
-                   PLAYBACK_BLOCK_BYTES - chunk * sizeof(int16_t));
-        }
-
-        if (xQueueSend(s_playback_queue, s_playback_enqueue_block, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Speaker playback queue penuh; PCM chunk drop");
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Speaker I2S write gagal: offset=%u chunk=%u written=%u err=%s",
+                     (unsigned)offset,
+                     (unsigned)chunk,
+                     (unsigned)written,
+                     esp_err_to_name(err));
             return false;
         }
 
-        offset += chunk;
+        if (written == 0) {
+            ESP_LOGW(TAG, "Speaker I2S write no-progress: offset=%u chunk=%u",
+                     (unsigned)offset,
+                     (unsigned)chunk);
+            return false;
+        }
+
+        offset += written;
     }
 
+    if (offset != samples) {
+        ESP_LOGW(TAG, "Speaker PCM interrupted: written=%u/%u",
+                 (unsigned)offset, (unsigned)samples);
+        return false;
+    }
+
+    (void)timeout_ms;
     return true;
 }
