@@ -143,10 +143,7 @@ extern "C" bool audio_engine_init(void)
     if (s_initialized) return true;
 
     ESP_LOGI(TAG, "Initializing AudioEngine");
-    if (audio_hal_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Audio HAL initialization failed");
-        return false;
-    }
+    audio_hal_init();
 
     if (!wakeword_init()) {
         ESP_LOGE(TAG, "WakeWord initialization failed");
