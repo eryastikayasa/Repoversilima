@@ -10,7 +10,6 @@
 #include "freertos/semphr.h"
 
 static const char *TAG = "DISPLAY_DRV";
-
 static i2c_master_bus_handle_t s_i2c_bus = nullptr;
 static esp_lcd_panel_io_handle_t s_panel_io = nullptr;
 static esp_lcd_panel_handle_t s_panel = nullptr;
@@ -115,7 +114,6 @@ void display_driver_init(void)
     }
 
     s_ready = true;
-
     ESP_LOGI(TAG,
              "SSD1306 128x64 siap: SDA=%d SCL=%d ADDR=0x%02X SPEED=%dHz MIRROR=XY",
              DISPLAY_DRIVER_SDA_PIN,
@@ -127,20 +125,12 @@ void display_driver_init(void)
 void display_driver_present(const uint8_t *buffer, int width, int height)
 {
     if (!buffer) return;
-
-    if (!s_ready) {
-        display_driver_init();
-    }
-
+    if (!s_ready) display_driver_init();
     if (!s_ready || !s_panel || !s_oled_mutex) return;
 
     if (width != DISPLAY_DRIVER_WIDTH || height != DISPLAY_DRIVER_HEIGHT) {
-        ESP_LOGW(TAG,
-                 "Framebuffer ditolak: %dx%d, yang didukung %dx%d",
-                 width,
-                 height,
-                 DISPLAY_DRIVER_WIDTH,
-                 DISPLAY_DRIVER_HEIGHT);
+        ESP_LOGW(TAG, "Framebuffer ditolak: %dx%d, yang didukung %dx%d",
+                 width, height, DISPLAY_DRIVER_WIDTH, DISPLAY_DRIVER_HEIGHT);
         return;
     }
 
@@ -150,18 +140,11 @@ void display_driver_present(const uint8_t *buffer, int width, int height)
     }
 
     esp_err_t err = esp_lcd_panel_draw_bitmap(
-        s_panel,
-        0,
-        0,
-        DISPLAY_DRIVER_WIDTH,
-        DISPLAY_DRIVER_HEIGHT,
-        buffer);
+        s_panel, 0, 0, DISPLAY_DRIVER_WIDTH, DISPLAY_DRIVER_HEIGHT, buffer);
 
     xSemaphoreGive(s_oled_mutex);
 
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "OLED draw gagal: %s", esp_err_to_name(err));
-    }
+    if (err != ESP_OK) ESP_LOGW(TAG, "OLED draw gagal: %s", esp_err_to_name(err));
 }
 
 bool display_driver_is_ready(void)

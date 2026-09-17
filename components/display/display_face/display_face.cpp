@@ -1,394 +1,61 @@
 #include "display_face.h"
-
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_attr.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 namespace {
-
 static EXT_RAM_BSS_ATTR uint8_t s_face_buffer[DISPLAY_FACE_BUFFER_SIZE] = {0};
 static face_state_t s_current_face_state = FACE_IDLE;
 static face_state_t s_previous_face_state = FACE_IDLE;
-static uint32_t s_state_started_ms = 0;
-static uint32_t s_override_until_ms = 0;
+static uint32_t s_state_started_ms = 0, s_override_until_ms = 0;
 static bool s_override_active = false;
-
-static void pixel(int x, int y, bool on = true)
-{
-    if (x < 0 || x >= DISPLAY_FACE_WIDTH || y < 0 || y >= DISPLAY_FACE_HEIGHT) return;
-    uint8_t &byte = s_face_buffer[x + (y >> 3) * DISPLAY_FACE_WIDTH];
-    const uint8_t mask = (uint8_t)(1U << (y & 7));
-    if (on) byte |= mask;
-    else byte &= (uint8_t)~mask;
+static uint32_t s_rng = 0x6D2B79F5u, s_next_behavior_ms = 0;
+static int s_target_gaze_x=0,s_target_gaze_y=0,s_target_micro_x=0,s_target_micro_y=0;
+static int s_current_gaze_x=0,s_current_gaze_y=0,s_current_micro_x=0,s_current_micro_y=0;
+enum idle_behavior_t:uint8_t{IDLE_REST=0,IDLE_GLANCE,IDLE_CURIOUS,IDLE_MICRO_SHIFT};
+static idle_behavior_t s_idle_behavior=IDLE_REST; static uint32_t s_idle_behavior_until_ms=0; static bool s_idle_return_pending=false;
+static uint32_t s_next_blink_ms=0,s_blink_started_ms=0; static uint16_t s_blink_duration_ms=0; static uint8_t s_blink_phase=0; static bool s_blink_double_pending=false;
+enum mouth_shape_t:uint8_t{MOUTH_CLOSED=0,MOUTH_SMALL,MOUTH_MEDIUM,MOUTH_WIDE};
+static mouth_shape_t s_mouth_shape=MOUTH_CLOSED; static uint32_t s_mouth_shape_until_ms=0; static uint8_t s_mouth_shape_count=0;
+static uint32_t s_transition_started_ms=0; static face_state_t s_transition_from=FACE_IDLE,s_transition_to=FACE_IDLE; static constexpr uint32_t FACE_TRANSITION_MS=220U;
+static portMUX_TYPE s_face_state_mux=portMUX_INITIALIZER_UNLOCKED;
+static uint32_t rand32(void){uint32_t x=s_rng;x^=x<<13;x^=x>>17;x^=x<<5;s_rng=x?x:0xA341316Cu;return s_rng;}
+static int rand_range(int a,int b){return b<=a?a:a+(int)(rand32()%(uint32_t)(b-a+1));}
+static int clamp_i(int v,int a,int b){return v<a?a:v>b?b:v;}
+static int smooth_step(int v,int t,int p){if(v==t)return v;int d=(t-v)*p/100;return v+(d?d:(t>v?1:-1));}
+static void pixel(int x,int y,bool on=true){if(x<0||x>=DISPLAY_FACE_WIDTH||y<0||y>=DISPLAY_FACE_HEIGHT)return;uint8_t &b=s_face_buffer[x+(y>>3)*DISPLAY_FACE_WIDTH];uint8_t m=(uint8_t)(1U<<(y&7));if(on)b|=m;else b&=(uint8_t)~m;}
+static void line(int x0,int y0,int x1,int y1){int dx=abs(x1-x0),sx=x0<x1?1:-1,dy=-abs(y1-y0),sy=y0<y1?1:-1,e=dx+dy;for(;;){pixel(x0,y0);if(x0==x1&&y0==y1)break;int e2=2*e;if(e2>=dy){e+=dy;x0+=sx;}if(e2<=dx){e+=dx;y0+=sy;}}}
+static void fill_circle(int cx,int cy,int r){for(int y=-r;y<=r;++y){int q=r*r-y*y,dx=q>0?(int)sqrtf((float)q):0;for(int x=-dx;x<=dx;++x)pixel(cx+x,cy+y);}}
+static void draw_cat_ears(int oy){line(18,14+oy,20,4+oy);line(20,4+oy,30,13+oy);line(98,13+oy,108,4+oy);line(108,4+oy,110,14+oy);line(21,11+oy,23,8+oy);line(23,8+oy,27,12+oy);line(101,12+oy,105,8+oy);line(105,8+oy,107,11+oy);}
+static void draw_open_eye(int cx,int cy,int gx,int gy,int sx,int sy,int openness=14){int er=clamp_i(openness,9,14),pr=er>=13?7:6;gx=clamp_i(gx,-7,7);gy=clamp_i(gy,-5,5);int ex=cx+sx,ey=cy+sy,px=ex+gx,py=ey+gy;fill_circle(ex,ey,er);for(int y=-pr;y<=pr;++y){int q=pr*pr-y*y,dx=q>0?(int)sqrtf((float)q):0;for(int x=-dx;x<=dx;++x)pixel(px+x,py+y,false);}fill_circle(px-2,py-3,2);}
+static void draw_blink_eye(int cx,int cy,int open){if(open<=0){line(cx-11,cy,cx+11,cy);return;}int h=5+open/3;line(cx-11,cy+1,cx-h,cy);line(cx-h,cy,cx,cy+1);line(cx,cy+1,cx+h,cy);line(cx+h,cy,cx+11,cy+1);}
+static void draw_happy_eye(int cx,int cy){for(int x=-12;x<=12;++x){float t=(float)x/12.0f;int y=(int)(6.0f*(1.0f-t*t));pixel(cx+x,cy+y);if(!(x&1))pixel(cx+x,cy+y+1);}}
+static void draw_normal_brow(int cx,int cy,int lift=0){static const int p[][2]={{-13,2},{-12,1},{-11,0},{-10,-1},{-9,-2},{-8,-3},{-7,-4},{-5,-5},{-3,-5},{0,-5},{3,-5},{5,-5},{7,-4},{8,-3},{9,-2},{10,-1},{11,0},{12,1},{13,2}};for(size_t i=0;i<sizeof(p)/sizeof(p[0]);++i){pixel(cx+p[i][0],cy+p[i][1]-lift);pixel(cx+p[i][0],cy+p[i][1]+1-lift);}}
+static void draw_attentive_brow(int cx,int cy){line(cx-13,cy+1,cx-6,cy-3);line(cx-6,cy-3,cx,cy-4);line(cx,cy-4,cx+6,cy-3);line(cx+6,cy-3,cx+13,cy+1);}
+static void draw_thinking_brow(int cx,int cy,bool left){if(left)line(cx-13,cy-1,cx+10,cy-5);else line(cx-10,cy-5,cx+13,cy-1);}
+static void draw_sad_brow(int cx,int cy,bool left){if(left){line(cx-13,cy-1,cx,cy+5);line(cx,cy+5,cx+13,cy+9);}else{line(cx-13,cy+9,cx,cy+5);line(cx,cy+5,cx+13,cy-1);}}
+static void draw_sad_eye(int cx,int cy,int gy){int y=cy+gy;line(cx-11,y,cx-5,y+2);line(cx-5,y+2,cx+5,y+2);line(cx+5,y+2,cx+11,y);}
+static void draw_sleep_eye(int cx,int cy,int lid){line(cx-12,cy,cx+12,cy);if(lid>0)line(cx-8,cy+1,cx+8,cy+1);}
+static void draw_error_eye(int cx,int cy,int pulse){int size=9+pulse;for(int i=-size;i<=size;++i){pixel(cx+i,cy+i);pixel(cx+i,cy-i);}}
+static void draw_mouth(mouth_shape_t shape,int oy){int cx=64,cy=53+oy;switch(shape){case MOUTH_CLOSED:line(cx-5,cy,cx+5,cy);break;case MOUTH_SMALL:line(cx-4,cy-1,cx,cy+1);line(cx,cy+1,cx+4,cy-1);break;case MOUTH_MEDIUM:line(cx-5,cy-2,cx,cy+3);line(cx,cy+3,cx+5,cy-2);line(cx-5,cy-2,cx+5,cy-2);break;case MOUTH_WIDE:line(cx-7,cy-2,cx,cy+4);line(cx,cy+4,cx+7,cy-2);line(cx-7,cy-2,cx+7,cy-2);line(cx-3,cy+1,cx+3,cy+1);break;}}
+static void choose_idle_behavior(uint32_t now){int r=rand_range(0,99);if(r<60){s_idle_behavior=IDLE_REST;s_target_gaze_x=s_target_gaze_y=s_target_micro_x=s_target_micro_y=0;s_idle_behavior_until_ms=now+(uint32_t)rand_range(900,2400);}else if(r<84){s_idle_behavior=IDLE_GLANCE;s_target_gaze_x=rand_range(-5,5);s_target_gaze_y=rand_range(-1,2);s_target_micro_x=s_target_micro_y=0;s_idle_behavior_until_ms=now+(uint32_t)rand_range(500,1200);}else if(r<92){s_idle_behavior=IDLE_CURIOUS;s_target_gaze_x=rand_range(-4,4);s_target_gaze_y=rand_range(-3,-1);s_target_micro_x=rand_range(-1,1);s_target_micro_y=0;s_idle_behavior_until_ms=now+(uint32_t)rand_range(400,900);}else{s_idle_behavior=IDLE_MICRO_SHIFT;s_target_gaze_x=s_target_gaze_y=0;s_target_micro_x=rand_range(-1,1);s_target_micro_y=rand_range(-1,1);s_idle_behavior_until_ms=now+(uint32_t)rand_range(350,750);}s_idle_return_pending=s_idle_behavior!=IDLE_REST;}
+static void schedule_behavior(uint32_t now,face_state_t st){if(st==FACE_SLEEP){s_target_gaze_x=s_target_gaze_y=s_target_micro_x=s_target_micro_y=0;s_next_behavior_ms=now+800;return;}if(st==FACE_IDLE){if(s_next_behavior_ms==0||(int32_t)(now-s_next_behavior_ms)>=0){if(s_idle_behavior==IDLE_REST||(int32_t)(now-s_idle_behavior_until_ms)>=0){if(s_idle_return_pending){s_target_gaze_x=s_target_gaze_y=s_target_micro_x=s_target_micro_y=0;s_idle_return_pending=false;s_idle_behavior=IDLE_REST;s_idle_behavior_until_ms=now+(uint32_t)rand_range(450,1000);}else choose_idle_behavior(now);}s_next_behavior_ms=now+120;}return;}if(st==FACE_LISTENING){if((int32_t)(now-s_next_behavior_ms)>=0){s_target_gaze_x=rand_range(-2,2);s_target_gaze_y=rand_range(-1,1);s_target_micro_x=s_target_micro_y=0;s_next_behavior_ms=now+(uint32_t)rand_range(900,1700);}return;}if(st==FACE_THINKING){if((int32_t)(now-s_next_behavior_ms)>=0){int c=rand_range(0,2);s_target_gaze_x=c==0?0:c==1?-3:3;s_target_gaze_y=c==0?-4:-3;s_target_micro_x=s_target_micro_y=0;s_next_behavior_ms=now+(uint32_t)rand_range(900,1800);}return;}if(st==FACE_SPEAKING){if((int32_t)(now-s_next_behavior_ms)>=0){s_target_gaze_x=rand_range(-2,2);s_target_gaze_y=rand_range(-1,1);s_target_micro_x=rand_range(-1,1);s_target_micro_y=0;s_next_behavior_ms=now+(uint32_t)rand_range(700,1400);}return;}s_target_gaze_x=s_target_gaze_y=s_target_micro_x=s_target_micro_y=0;s_next_behavior_ms=now+1000;}
+static void update_blink(uint32_t now,face_state_t st){if(st==FACE_SLEEP){s_blink_phase=0;s_next_blink_ms=now+1000;return;}if(s_blink_phase==0){if(s_next_blink_ms==0)s_next_blink_ms=now+(uint32_t)rand_range(1800,5200);if((int32_t)(now-s_next_blink_ms)>=0){s_blink_phase=1;s_blink_started_ms=now;int style=rand_range(0,9);s_blink_duration_ms=(uint16_t)(style==0?rand_range(90,125):rand_range(55,90));s_blink_double_pending=style==1;}return;}uint32_t t=now-s_blink_started_ms,d=s_blink_duration_ms?s_blink_duration_ms:70,close_ms=d/3,open_ms=d/3;if(t<close_ms)s_blink_phase=1;else if(t<d-open_ms)s_blink_phase=2;else if(t<d)s_blink_phase=3;else{s_blink_phase=0;if(s_blink_double_pending){s_blink_double_pending=false;s_next_blink_ms=now+95;}else s_next_blink_ms=now+(uint32_t)rand_range(1800,5200);}}
+static int blink_openness(uint32_t now){if(s_blink_phase==0)return 14;uint32_t t=now-s_blink_started_ms,d=s_blink_duration_ms?s_blink_duration_ms:70,half=d/2?d/2:1;if(t>=d)return 14;return t<half?(int)(14U-(t*14U)/half):(int)(((t-half)*14U)/half);}
+static void update_mouth_scheduler(uint32_t now,face_state_t st){if(st!=FACE_SPEAKING){s_mouth_shape=MOUTH_CLOSED;s_mouth_shape_until_ms=now;s_mouth_shape_count=0;return;}if((int32_t)(now-s_mouth_shape_until_ms)<0)return;mouth_shape_t next=MOUTH_SMALL;int r=rand_range(0,99);if(s_mouth_shape_count==0)next=r<35?MOUTH_CLOSED:MOUTH_SMALL;else if(r<28)next=MOUTH_CLOSED;else if(r<65)next=MOUTH_SMALL;else if(r<90)next=MOUTH_MEDIUM;else next=MOUTH_WIDE;if(next==s_mouth_shape&&next!=MOUTH_CLOSED)next=next==MOUTH_SMALL?MOUTH_MEDIUM:MOUTH_SMALL;s_mouth_shape=next;++s_mouth_shape_count;s_mouth_shape_until_ms=now+(uint32_t)rand_range(60,160);}
+static void render_face(uint32_t now){memset(s_face_buffer,0,sizeof(s_face_buffer));face_state_t state;portENTER_CRITICAL(&s_face_state_mux);state=s_current_face_state;portEXIT_CRITICAL(&s_face_state_mux);schedule_behavior(now,state);s_current_gaze_x=smooth_step(s_current_gaze_x,s_target_gaze_x,18);s_current_gaze_y=smooth_step(s_current_gaze_y,s_target_gaze_y,16);s_current_micro_x=smooth_step(s_current_micro_x,s_target_micro_x,14);s_current_micro_y=smooth_step(s_current_micro_y,s_target_micro_y,14);update_blink(now,state);update_mouth_scheduler(now,state);uint32_t t=now-s_state_started_ms;int ox=s_current_micro_x,oy=s_current_micro_y,gx=s_current_gaze_x,gy=s_current_gaze_y,eye_open=blink_openness(now);bool happy=false,sad=false,sleep=false,error=false,curious=false;switch(state){case FACE_IDLE:curious=s_idle_behavior==IDLE_CURIOUS;if(curious)ox=clamp_i(ox,-1,1);break;case FACE_LISTENING:gx=clamp_i(gx,-3,3);gy=clamp_i(gy,-2,2);oy-=1;eye_open=s_blink_phase==0?14:eye_open;break;case FACE_THINKING:gy=clamp_i(gy,-5,-2);break;case FACE_SPEAKING:gx=clamp_i(gx,-3,3);gy=clamp_i(gy,-2,2);break;case FACE_HAPPY:happy=true;if(t<220)oy-=(int)((220-t)/110);break;case FACE_SAD:sad=true;gy=3;oy+=1;break;case FACE_ERROR:error=true;if(t<500)ox+=((t/140)&1U)?1:-1;break;case FACE_SLEEP:sleep=true;gx=gy=ox=0;oy+=((t/1800)&1U)?0:1;break;default:break;}if((int32_t)(now-s_transition_started_ms)<(int32_t)FACE_TRANSITION_MS){uint32_t dt=now-s_transition_started_ms;int pulse=dt<FACE_TRANSITION_MS/2U?1:0;if(s_transition_to==FACE_LISTENING)oy-=pulse;else if(s_transition_to==FACE_SPEAKING)oy+=pulse;else if(s_transition_to==FACE_ERROR)ox+=pulse;}draw_cat_ears(oy);int lx=34+ox,rx=94+ox,ey=28+oy;if(sleep){draw_sleep_eye(lx,ey+1,1);draw_sleep_eye(rx,ey+1,1);}else if(error){int pulse=(t<600U&&((t/260U)&1U))?1:0;draw_error_eye(lx,ey,pulse);draw_error_eye(rx,ey,pulse);}else if(happy){draw_happy_eye(lx,ey);draw_happy_eye(rx,ey);}else if(sad){draw_sad_eye(lx,ey,gy);draw_sad_eye(rx,ey,gy);}else if(s_blink_phase!=0){draw_blink_eye(lx,ey,eye_open);draw_blink_eye(rx,ey,eye_open);}else{int openness=state==FACE_THINKING?13:14;draw_open_eye(lx,ey,gx,gy,0,0,openness);draw_open_eye(rx,ey,gx,gy,0,0,openness);}int by=14+oy;switch(state){case FACE_LISTENING:draw_attentive_brow(lx,by);draw_attentive_brow(rx,by);break;case FACE_THINKING:draw_thinking_brow(lx,by,true);draw_thinking_brow(rx,by,false);break;case FACE_SAD:draw_sad_brow(lx,by,true);draw_sad_brow(rx,by,false);break;case FACE_ERROR:draw_normal_brow(lx,by,3);draw_normal_brow(rx,by,3);break;case FACE_IDLE:draw_normal_brow(lx,by,curious?2:0);draw_normal_brow(rx,by,curious?2:0);break;default:draw_normal_brow(lx,by,state==FACE_HAPPY?1:0);draw_normal_brow(rx,by,state==FACE_HAPPY?1:0);break;}if(state==FACE_HAPPY){draw_mouth(MOUTH_MEDIUM,oy);for(int x=-10;x<=10;++x){float q=(float)x/10.0f;int y=(int)(5.0f*(1.0f-q*q));pixel(64+x,53+oy+y);}}else if(state==FACE_SAD){line(55,56+oy,64,53+oy);line(64,53+oy,73,56+oy);}else if(state==FACE_ERROR){line(57,55+oy,62,52+oy);line(62,52+oy,67,55+oy);line(67,55+oy,72,52+oy);}else if(state==FACE_SLEEP){draw_mouth(MOUTH_CLOSED,oy);}else{draw_mouth(state==FACE_SPEAKING?s_mouth_shape:MOUTH_CLOSED,oy);}}
 }
 
-static void fill_circle(int cx, int cy, int radius)
-{
-    for (int y = -radius; y <= radius; ++y) {
-        const int q = radius * radius - y * y;
-        const int dx = q > 0 ? (int)sqrtf((float)q) : 0;
-        for (int x = -dx; x <= dx; ++x) pixel(cx + x, cy + y);
-    }
-}
-
-static void line(int x0, int y0, int x1, int y1)
-{
-    const int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    const int sx = x0 < x1 ? 1 : -1;
-    const int dy = y1 > y0 ? y0 - y1 : y1 - y0;
-    const int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    for (;;) {
-        pixel(x0, y0);
-        if (x0 == x1 && y0 == y1) break;
-        const int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
-static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y,
-                          int eye_shift_x, int eye_shift_y)
-{
-    constexpr int EYE_RADIUS = 14;
-    constexpr int PUPIL_RADIUS = 7;
-    if (gaze_x < -7) gaze_x = -7;
-    if (gaze_x > 7) gaze_x = 7;
-    if (gaze_y < -5) gaze_y = -5;
-    if (gaze_y > 5) gaze_y = 5;
-    const int eye_x = cx + eye_shift_x;
-    const int eye_y = cy + eye_shift_y;
-    const int pupil_x = eye_x + gaze_x;
-    const int pupil_y = eye_y + gaze_y;
-    fill_circle(eye_x, eye_y, EYE_RADIUS);
-    for (int y = -PUPIL_RADIUS; y <= PUPIL_RADIUS; ++y) {
-        const int q = PUPIL_RADIUS * PUPIL_RADIUS - y * y;
-        const int dx = q > 0 ? (int)sqrtf((float)q) : 0;
-        for (int x = -dx; x <= dx; ++x) pixel(pupil_x + x, pupil_y + y, false);
-    }
-    fill_circle(pupil_x - 2, pupil_y - 3, 3);
-}
-
-static void draw_blink_eye(int cx, int cy)
-{
-    line(cx - 11, cy, cx - 5, cy + 1);
-    line(cx - 5, cy + 1, cx + 5, cy + 1);
-    line(cx + 5, cy + 1, cx + 11, cy);
-}
-
-static void draw_happy_eye(int cx, int cy)
-{
-    for (int x = -12; x <= 12; ++x) {
-        const float t = (float)x / 12.0f;
-        const int y = (int)(7.0f * (1.0f - t * t));
-        pixel(cx + x, cy + y);
-        if ((x & 1) == 0) pixel(cx + x, cy + y + 1);
-    }
-}
-
-// Smooth-looking 2px brow: two nearby pixel curves instead of a hard 2px block.
-static void draw_normal_brow(int cx, int cy)
-{
-    static const int pts[][2] = {
-        {-13,  2}, {-12,  1}, {-11,  0}, {-10, -1}, {-9, -2}, {-8, -3},
-        {-7, -4}, {-5, -5}, {-3, -5}, {0, -5}, {3, -5}, {5, -5},
-        {7, -4}, {8, -3}, {9, -2}, {10, -1}, {11, 0}, {12, 1}, {13, 2}
-    };
-    for (size_t i = 0; i < sizeof(pts) / sizeof(pts[0]); ++i) {
-        pixel(cx + pts[i][0], cy + pts[i][1]);
-        pixel(cx + pts[i][0], cy + pts[i][1] + 1);
-    }
-}
-
-static void draw_sad_brow(int cx, int cy, bool left_eye)
-{
-    // Two-pixel smooth descending/ascending curve for a sad expression.
-    static const int left_pts[][2] = {
-        {-13, -1}, {-12, 0}, {-11, 0}, {-10, 1}, {-9, 1}, {-8, 2},
-        {-7, 2}, {-6, 3}, {-4, 4}, {-2, 5}, {0, 5}, {2, 6}, {4, 6},
-        {6, 7}, {8, 7}, {10, 8}, {12, 8}, {13, 9}
-    };
-    static const int right_pts[][2] = {
-        {-13, 9}, {-12, 8}, {-10, 8}, {-8, 7}, {-6, 7}, {-4, 6},
-        {-2, 6}, {0, 5}, {2, 5}, {4, 4}, {6, 3}, {7, 2}, {8, 2},
-        {9, 1}, {10, 1}, {11, 0}, {12, 0}, {13, -1}
-    };
-    const auto &pts = left_eye ? left_pts : right_pts;
-    constexpr size_t count = sizeof(left_pts) / sizeof(left_pts[0]);
-    for (size_t i = 0; i < count; ++i) {
-        pixel(cx + pts[i][0], cy + pts[i][1]);
-        pixel(cx + pts[i][0], cy + pts[i][1] + 1);
-    }
-}
-
-static void draw_sad_eye(int cx, int cy, int gaze_y)
-{
-    const int y = cy + gaze_y;
-    line(cx - 11, y, cx - 5, y + 2);
-    line(cx - 5, y + 2, cx + 5, y + 2);
-    line(cx + 5, y + 2, cx + 11, y);
-}
-
-static void draw_sleep_eye(int cx, int cy)
-{
-    // Solid 2px horizontal eyelid.
-    for (int x = cx - 12; x <= cx + 12; ++x) {
-        pixel(x, cy);
-        pixel(x, cy + 1);
-    }
-}
-
-static void draw_error_eye(int cx, int cy)
-{
-    // 2px diagonals: each diagonal is drawn twice with a one-pixel offset.
-    constexpr int SIZE = 10;
-    for (int i = -SIZE; i <= SIZE; ++i) {
-        pixel(cx + i, cy + i);
-        pixel(cx + i, cy + i + 1);
-        pixel(cx + i, cy - i);
-        pixel(cx + i, cy - i + 1);
-    }
-}
-
-static void render_mochi_gaze(int expr, int step,
-                              int sX, int sY,
-                              int gaze_x, int gaze_y,
-                              int eye_shift_x, int eye_shift_y)
-{
-    memset(s_face_buffer, 0, sizeof(s_face_buffer));
-    const int left_x = 34 + sX;
-    const int right_x = 94 + sX;
-    const int eye_y = 28 + sY;
-
-    if (expr != 99) {
-        if (expr == 6) {
-            draw_sad_brow(left_x + eye_shift_x, 14 + sY, true);
-            draw_sad_brow(right_x + eye_shift_x, 14 + sY, false);
-        } else {
-            draw_normal_brow(left_x + eye_shift_x, 14 + sY);
-            draw_normal_brow(right_x + eye_shift_x, 14 + sY);
-        }
-    }
-
-    if (step == 3) {
-        draw_sleep_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
-        draw_sleep_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
-        return;
-    }
-    if (expr == 2 && step == 2) {
-        draw_happy_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
-        draw_happy_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
-        return;
-    }
-    if (expr == 6) {
-        draw_sad_eye(left_x + eye_shift_x, eye_y + eye_shift_y, gaze_y);
-        draw_sad_eye(right_x + eye_shift_x, eye_y + eye_shift_y, gaze_y);
-        return;
-    }
-    if (expr == 99) {
-        draw_error_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
-        draw_error_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
-        return;
-    }
-    if (step == 1) {
-        draw_blink_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
-        draw_blink_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
-        return;
-    }
-    draw_open_eye(left_x, eye_y, gaze_x, gaze_y, eye_shift_x, eye_shift_y);
-    draw_open_eye(right_x, eye_y, gaze_x, gaze_y, eye_shift_x, eye_shift_y);
-}
-
-static uint32_t elapsed_ms(uint32_t now_ms)
-{
-    return now_ms - s_state_started_ms;
-}
-
-static void animation_parameters(uint32_t now_ms,
-                                 int &expr,
-                                 int &step,
-                                 int &gaze_x,
-                                 int &gaze_y,
-                                 int &eye_shift_x,
-                                 int &eye_shift_y)
-{
-    expr = 0;
-    step = 0;
-    gaze_x = 0;
-    gaze_y = 0;
-    eye_shift_x = 0;
-    eye_shift_y = 0;
-
-    const uint32_t t = elapsed_ms(now_ms);
-
-    switch (s_current_face_state) {
-        case FACE_IDLE: {
-            const uint32_t cycle = t % 4200;
-            if (cycle < 500) gaze_x = -3;
-            else if (cycle < 1000) gaze_x = 0;
-            else if (cycle < 1500) gaze_x = 3;
-            else if (cycle < 2000) gaze_x = 0;
-            else if (cycle >= 3000 && cycle < 3120) step = 1;
-            break;
-        }
-        case FACE_LISTENING: {
-            expr = 1;
-            const uint32_t cycle = t % 3600;
-            if (cycle < 700) gaze_x = -2;
-            else if (cycle < 1400) gaze_x = 0;
-            else if (cycle < 2100) gaze_x = 2;
-            else gaze_x = 0;
-            if (cycle >= 2500 && cycle < 2620) step = 1;
-            break;
-        }
-        case FACE_THINKING: {
-            expr = 0;
-            const uint32_t cycle = t % 4200;
-            if (cycle < 1200) gaze_y = -5;
-            else if (cycle < 2000) { gaze_y = -5; gaze_x = -3; }
-            else if (cycle < 2800) { gaze_y = -5; gaze_x = 3; }
-            else gaze_y = 0;
-            if (cycle >= 3200 && cycle < 3320) step = 1;
-            break;
-        }
-        case FACE_SPEAKING: {
-            expr = 2;
-            const uint32_t cycle = t % 1800;
-            if (cycle < 450) gaze_x = 0;
-            else if (cycle < 900) gaze_x = 2;
-            else if (cycle < 1350) gaze_x = 0;
-            else gaze_x = -2;
-            if (cycle >= 1550 && cycle < 1670) step = 1;
-            break;
-        }
-        case FACE_HAPPY: {
-            expr = 2;
-            const uint32_t cycle = t % 2600;
-            if (cycle < 800) step = 2;
-            else if (cycle < 1050) step = 1;
-            else if (cycle < 1700) step = 2;
-            else if (cycle < 2100) { step = 0; gaze_x = 3; }
-            else step = 2;
-            break;
-        }
-        case FACE_SAD: {
-            expr = 6;
-            const uint32_t cycle = t % 3200;
-            if (cycle < 1000) gaze_y = 2;
-            else if (cycle < 2000) gaze_y = 3;
-            else gaze_y = 2;
-            break;
-        }
-        case FACE_ERROR:
-            expr = 99;
-            break;
-        case FACE_SLEEP:
-            step = 3;
-            break;
-        default:
-            break;
-    }
-}
-
-static void render_current_face(uint32_t now_ms)
-{
-    int expr = 0;
-    int step = 0;
-    int gaze_x = 0;
-    int gaze_y = 0;
-    int eye_shift_x = 0;
-    int eye_shift_y = 0;
-    animation_parameters(now_ms, expr, step, gaze_x, gaze_y,
-                         eye_shift_x, eye_shift_y);
-    render_mochi_gaze(expr, step, 0, 0,
-                      gaze_x, gaze_y, eye_shift_x, eye_shift_y);
-}
-
-} // namespace
-
-void display_face_init(void)
-{
-    s_current_face_state = FACE_IDLE;
-    s_previous_face_state = FACE_IDLE;
-    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    s_state_started_ms = now_ms;
-    s_override_until_ms = 0;
-    s_override_active = false;
-    memset(s_face_buffer, 0, sizeof(s_face_buffer));
-    render_current_face(now_ms);
-}
-
-void display_face_update(uint32_t now_ms)
-{
-    if (s_override_active && (int32_t)(now_ms - s_override_until_ms) >= 0) {
-        s_override_active = false;
-        s_current_face_state = s_previous_face_state;
-        s_state_started_ms = now_ms;
-    }
-    render_current_face(now_ms);
-}
-
-void display_face_set_state(face_state_t state)
-{
-    if (state < FACE_IDLE || state > FACE_SLEEP) state = FACE_IDLE;
-    s_override_active = false;
-    s_current_face_state = state;
-    s_previous_face_state = state;
-    s_state_started_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-void display_face_show_for_ms(face_state_t state, uint32_t duration_ms)
-{
-    if (state < FACE_IDLE || state > FACE_SLEEP) state = FACE_IDLE;
-    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    if (duration_ms == 0) {
-        display_face_set_state(state);
-        return;
-    }
-    s_previous_face_state = s_current_face_state;
-    s_current_face_state = state;
-    s_state_started_ms = now_ms;
-    s_override_until_ms = now_ms + duration_ms;
-    s_override_active = true;
-}
-
-face_state_t display_face_get_state(void)
-{
-    return s_current_face_state;
-}
-
-void display_face_render_mochi_gaze(int expr, int step,
-                                    int sX, int sY,
-                                    int gaze_x, int gaze_y,
-                                    int eye_shift_x, int eye_shift_y)
-{
-    render_mochi_gaze(expr, step, sX, sY,
-                      gaze_x, gaze_y, eye_shift_x, eye_shift_y);
-}
-
-void display_face_render_mochi(int expr, int step,
-                               int sX, int sY, int arahLirik)
-{
-    int gaze_x = 0;
-    int gaze_y = 0;
-    switch (arahLirik) {
-        case 1: gaze_x = -5; break;
-        case 2: gaze_x = 5; break;
-        case 3: gaze_y = -5; break;
-        default: break;
-    }
-    display_face_render_mochi_gaze(expr, step, sX, sY,
-                                   gaze_x, gaze_y, 0, 0);
-}
-
-void display_face_render(void)
-{
-    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    render_current_face(now_ms);
-}
-
-const uint8_t *display_face_buffer(void)
-{
-    return s_face_buffer;
-}
+void display_face_init(void){uint32_t now=(uint32_t)(esp_timer_get_time()/1000ULL);portENTER_CRITICAL(&s_face_state_mux);s_current_face_state=FACE_IDLE;s_previous_face_state=FACE_IDLE;s_state_started_ms=now;s_override_until_ms=0;s_override_active=false;portEXIT_CRITICAL(&s_face_state_mux);s_rng^=now+0x9E3779B9u;s_next_behavior_ms=now+500;s_idle_behavior=IDLE_REST;s_idle_behavior_until_ms=now+1200;s_idle_return_pending=false;s_next_blink_ms=now+(uint32_t)rand_range(1800,4200);s_blink_phase=0;s_blink_double_pending=false;s_current_gaze_x=s_current_gaze_y=s_target_gaze_x=s_target_gaze_y=0;s_current_micro_x=s_current_micro_y=s_target_micro_x=s_target_micro_y=0;s_mouth_shape=MOUTH_CLOSED;s_mouth_shape_until_ms=now;s_mouth_shape_count=0;s_transition_started_ms=now;s_transition_from=s_transition_to=FACE_IDLE;memset(s_face_buffer,0,sizeof(s_face_buffer));render_face(now);}
+void display_face_update(uint32_t now){portENTER_CRITICAL(&s_face_state_mux);if(s_override_active&&(int32_t)(now-s_override_until_ms)>=0){s_override_active=false;s_current_face_state=s_previous_face_state;s_state_started_ms=now;s_next_behavior_ms=now;}portEXIT_CRITICAL(&s_face_state_mux);render_face(now);}
+void display_face_set_state(face_state_t state){if(state<FACE_IDLE||state>FACE_SLEEP)state=FACE_IDLE;uint32_t now=(uint32_t)(esp_timer_get_time()/1000ULL);portENTER_CRITICAL(&s_face_state_mux);if(state==s_current_face_state){portEXIT_CRITICAL(&s_face_state_mux);return;}s_transition_from=s_current_face_state;s_transition_to=state;s_transition_started_ms=now;s_previous_face_state=s_current_face_state;s_current_face_state=state;s_state_started_ms=now;s_override_active=false;portEXIT_CRITICAL(&s_face_state_mux);s_next_behavior_ms=now+350;s_target_micro_x=s_target_micro_y=0;if(state==FACE_SPEAKING)s_mouth_shape_until_ms=now;}
+void display_face_show_for_ms(face_state_t state,uint32_t duration_ms){if(state<FACE_IDLE||state>FACE_SLEEP)state=FACE_IDLE;if(duration_ms==0){display_face_set_state(state);return;}uint32_t now=(uint32_t)(esp_timer_get_time()/1000ULL);portENTER_CRITICAL(&s_face_state_mux);s_previous_face_state=s_current_face_state;s_transition_from=s_current_face_state;s_transition_to=state;s_transition_started_ms=now;s_current_face_state=state;s_state_started_ms=now;s_override_until_ms=now+duration_ms;s_override_active=true;portEXIT_CRITICAL(&s_face_state_mux);s_next_behavior_ms=now+350;s_target_micro_x=s_target_micro_y=0;if(state==FACE_SPEAKING)s_mouth_shape_until_ms=now;}
+face_state_t display_face_get_state(void){face_state_t state;portENTER_CRITICAL(&s_face_state_mux);state=s_current_face_state;portEXIT_CRITICAL(&s_face_state_mux);return state;}
+void display_face_render_mochi_gaze(int expr,int step,int sX,int sY,int gaze_x,int gaze_y,int eye_shift_x,int eye_shift_y){memset(s_face_buffer,0,sizeof(s_face_buffer));draw_cat_ears(sY);int left_x=34+sX+eye_shift_x,right_x=94+sX+eye_shift_x,eye_y=28+sY+eye_shift_y;if(expr==6){draw_sad_brow(left_x,14+sY,true);draw_sad_brow(right_x,14+sY,false);draw_sad_eye(left_x,eye_y,gaze_y);draw_sad_eye(right_x,eye_y,gaze_y);draw_mouth(MOUTH_CLOSED,sY);}else if(expr==2&&step==2){draw_happy_eye(left_x,eye_y);draw_happy_eye(right_x,eye_y);draw_normal_brow(left_x,14+sY,1);draw_normal_brow(right_x,14+sY,1);draw_mouth(MOUTH_MEDIUM,sY);}else if(expr==99){draw_error_eye(left_x,eye_y,0);draw_error_eye(right_x,eye_y,0);draw_normal_brow(left_x,14+sY,3);draw_normal_brow(right_x,14+sY,3);draw_mouth(MOUTH_MEDIUM,sY);}else if(step==3){draw_sleep_eye(left_x,eye_y,1);draw_sleep_eye(right_x,eye_y,1);draw_mouth(MOUTH_CLOSED,sY);}else if(step==1){draw_blink_eye(left_x,eye_y,0);draw_blink_eye(right_x,eye_y,0);draw_normal_brow(left_x,14+sY);draw_normal_brow(right_x,14+sY);draw_mouth(MOUTH_CLOSED,sY);}else{draw_open_eye(left_x,eye_y,gaze_x,gaze_y,0,0,expr==1?14:13);draw_open_eye(right_x,eye_y,gaze_x,gaze_y,0,0,expr==1?14:13);if(expr==1){draw_attentive_brow(left_x,14+sY);draw_attentive_brow(right_x,14+sY);draw_mouth(MOUTH_SMALL,sY);}else{draw_normal_brow(left_x,14+sY);draw_normal_brow(right_x,14+sY);draw_mouth(MOUTH_CLOSED,sY);}}}
+void display_face_render_mochi(int expr,int step,int sX,int sY,int arahLirik){display_face_render_mochi_gaze(expr,step,sX,sY,clamp_i(arahLirik,-7,7),0,0,0);}
+void display_face_render(void){render_face((uint32_t)(esp_timer_get_time()/1000ULL));}
+const uint8_t *display_face_buffer(void){return s_face_buffer;}
