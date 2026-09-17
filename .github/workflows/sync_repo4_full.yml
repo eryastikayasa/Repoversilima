@@ -1,0 +1,39 @@
+name: Sync Repo4 to Repo5
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo5
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Replace entire repository with Repo4 main
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/repo4
+          git clone --depth 1 --branch main https://github.com/eryastikayasa/Repoversiempat.git /tmp/repo4
+          rm -rf /tmp/repo4/.git
+          rsync -a --delete --exclude='.git/' /tmp/repo4/ ./
+
+      - name: Commit exact mirror to Repo5 main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repo5 already matches Repo4 main"
+            exit 0
+          fi
+          git commit -m "sync: make Repo5 identical to Repo4 main"
+          git push origin HEAD:main
