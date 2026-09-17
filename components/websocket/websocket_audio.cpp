@@ -1,146 +1,351 @@
-#include "websocket_audio.h"
-#include "websocket.h"
-#include "websocket_event.h"
-#include "gemini/gemini_audio.h"
-#include "audio_engine.h"
+#include "websocket_internal.h"
+#include "websocket_mgr.h"
+#include "audio_hal.h"
+#include "display.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 static const char *TAG = "WS_AUDIO";
+static volatile bool audio_clear_pending = false;
 
-// AudioEngine contract: 20 ms = 320 samples @ 16 kHz PCM16 mono.
-static constexpr size_t FRAME_SAMPLES = 320;
-static constexpr size_t FRAME_BYTES = FRAME_SAMPLES * sizeof(int16_t);
-// Match Repo3 producer contract: 5 x 20 ms = 100 ms / 3200 bytes.
-static constexpr size_t FRAMES_PER_BUFFER = 5;
-static constexpr size_t TX_BUFFER_BYTES = FRAME_BYTES * FRAMES_PER_BUFFER;
-static constexpr uint32_t TASK_STACK = 6144;
-static constexpr UBaseType_t TASK_PRIORITY = 5;
-static constexpr int32_t SILENCE_THRESHOLD = 500;
-static constexpr size_t MIN_ACTIVE_SAMPLES = 8;
+static StaticSemaphore_t audio_send_mutex_storage;
+static SemaphoreHandle_t audio_send_mutex = NULL;
 
-static TaskHandle_t s_task = nullptr;
-static volatile bool s_running = false;
+#define AUDIO_OUTPUT_SAMPLE_RATE       24000U
+#define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
+#define AUDIO_RING_BUFFER_SIZE         (512 * 1024)
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (128 * 1024)
+#define AUDIO_PLAYBACK_READ_SIZE       2048
+#define AUDIO_PLAYBACK_READ_WAIT_MS    5
+#define AUDIO_PLAYBACK_TRIGGER_SIZE    1024
+#define AUDIO_SEND_CHUNK_SIZE          512
+#define AUDIO_SEND_WAIT_MS             50
 
-static bool mic_buffer_has_activity(const int16_t *pcm, size_t samples)
+static volatile uint32_t audio_turn_generation = 0;
+
+static size_t send_realtime_pcm(const uint8_t *data, size_t len)
 {
-    if (!pcm || samples == 0) return false;
+    if (audio_stream == NULL || data == NULL || len == 0) return 0;
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = len - offset;
+        if (chunk > AUDIO_SEND_CHUNK_SIZE) chunk = AUDIO_SEND_CHUNK_SIZE;
+        chunk &= ~((size_t)1);
+        if (chunk == 0) break;
 
-    size_t active_samples = 0;
-    for (size_t i = 0; i < samples; ++i) {
-        const int32_t sample = pcm[i];
-        const int32_t magnitude = sample < 0 ? -sample : sample;
-        if (magnitude >= SILENCE_THRESHOLD) {
-            ++active_samples;
-            if (active_samples >= MIN_ACTIVE_SAMPLES) return true;
+        TickType_t start = xTaskGetTickCount();
+        while (xStreamBufferSpacesAvailable(audio_stream) < chunk) {
+            if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(50)) break;
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
+        if (xStreamBufferSpacesAvailable(audio_stream) < chunk) break;
+
+        size_t written = xStreamBufferSend(audio_stream, data + offset, chunk,
+                                           pdMS_TO_TICKS(AUDIO_SEND_WAIT_MS));
+        if (written > 0) {
+            if (written > chunk) written = chunk;
+            written &= ~((size_t)1);
+            offset += written;
+            audio_bytes_queued += written;
+            if (written < chunk) continue;
+            continue;
+        }
+        ESP_LOGW(TAG, "Audio ring penuh: offset=%u/%u pending=%u spaces=%u",
+                 (unsigned)offset, (unsigned)len,
+                 (unsigned)xStreamBufferBytesAvailable(audio_stream),
+                 (unsigned)xStreamBufferSpacesAvailable(audio_stream));
     }
-    return false;
+    return offset;
 }
 
-static void websocket_audio_task(void *)
+size_t get_audio_pending_bytes(void)
 {
-    static int16_t tx_pcm[TX_BUFFER_BYTES / sizeof(int16_t)];
-    static int16_t frame_pcm[FRAME_SAMPLES];
-    size_t frames_collected = 0;
+    return audio_stream == NULL ? 0 : xStreamBufferBytesAvailable(audio_stream);
+}
 
+void check_audio_playback_complete(void)
+{
+    if (!audio_turn_complete_pending || audio_stream == NULL) return;
+    if (xStreamBufferBytesAvailable(audio_stream) != 0) return;
+    audio_turn_complete_pending = false;
+    audio_turn_active = false;
+    const uint64_t accounted = audio_bytes_queued + audio_bytes_dropped;
+    const int64_t balance = (int64_t)audio_bytes_received - (int64_t)accounted;
     ESP_LOGI(TAG,
-             "Audio uplink START: MIC frame=%u samples/%uB, TX buffer=%uB, central chunk=1600B",
-             (unsigned)FRAME_SAMPLES,
-             (unsigned)FRAME_BYTES,
-             (unsigned)TX_BUFFER_BYTES);
-
-    while (s_running) {
-        if (!websocket_is_connected()) {
-            frames_collected = 0;
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        // Exactly one blocking point: receive an already-captured 20 ms frame
-        // from AudioEngine. No WebSocket/TLS/JSON/Base64 operation happens here.
-        if (!audio_engine_read_mic_frame(frame_pcm, FRAME_SAMPLES, 100)) {
-            continue;
-        }
-
-        memcpy(tx_pcm + (frames_collected * FRAME_SAMPLES),
-               frame_pcm,
-               FRAME_BYTES);
-        ++frames_collected;
-
-        if (frames_collected < FRAMES_PER_BUFFER) continue;
-
-        // Repo3 does not uplink microphone audio while Gemini is speaking.
-        // This prevents echo/silence from competing with the central TX worker
-        // and preserves the same turn ownership semantics.
-        if (gemini_audio_turn_active()) {
-            frames_collected = 0;
-            continue;
-        }
-
-        // Match Repo3's MIC TX gate: do not continuously enqueue silence.
-        if (!mic_buffer_has_activity(tx_pcm, TX_BUFFER_BYTES / sizeof(int16_t))) {
-            static uint32_t silent_drops = 0;
-            ++silent_drops;
-            if ((silent_drops & 0x3FU) == 1U) {
-                ESP_LOGI(TAG, "MIC TX gate: silent 100ms buffer dropped total=%lu",
-                         (unsigned long)silent_drops);
-            }
-            frames_collected = 0;
-            continue;
-        }
-
-        const bool queued = websocket_tx_enqueue_audio(
-            reinterpret_cast<const uint8_t *>(tx_pcm),
-            TX_BUFFER_BYTES);
-        if (!queued) {
-            ESP_LOGW(TAG, "Audio TX buffer gagal di-enqueue; MIC tetap nonblocking");
-        }
-
-        frames_collected = 0;
-    }
-
-    s_task = nullptr;
-    ESP_LOGI(TAG, "Audio uplink STOP");
-    vTaskDelete(nullptr);
+             "AUDIO PLAYBACK COMPLETE: received=%llu queued=%llu played=%llu pending=0 dropped=%llu balance=%lld",
+             (unsigned long long)audio_bytes_received,
+             (unsigned long long)audio_bytes_queued,
+             (unsigned long long)audio_bytes_played,
+             (unsigned long long)audio_bytes_dropped,
+             (long long)balance);
+    face_set_state(FACE_LISTENING);
 }
 
-bool websocket_audio_start(void)
+static void audio_playback_task(void *arg)
 {
-    if (s_running) return true;
-    if (!audio_engine_conversation_active()) {
-        ESP_LOGW(TAG, "Conversation AudioEngine belum aktif");
+    (void)arg;
+    static uint8_t playback_buffer[AUDIO_PLAYBACK_READ_SIZE];
+    bool playback_started = false;
+    bool underrun_reported = false;
+    uint32_t playback_generation = 0;
+    int64_t last_stats_us = 0;
+    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u, core=%d priority=3",
+             (unsigned)AUDIO_RING_BUFFER_SIZE,
+             (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
+             xPortGetCoreID());
+
+    for (;;) {
+        if (audio_clear_pending) {
+            audio_clear_pending = false;
+            if (audio_send_mutex != NULL) {
+                if (xSemaphoreTake(audio_send_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    if (audio_stream != NULL) xStreamBufferReset(audio_stream);
+                    xSemaphoreGive(audio_send_mutex);
+                } else {
+                    ESP_LOGW(TAG, "Playback clear mutex busy - clear ditunda");
+                    audio_clear_pending = true;
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                    continue;
+                }
+            } else if (audio_stream != NULL) {
+                xStreamBufferReset(audio_stream);
+            }
+            audio_turn_complete_pending = false;
+            audio_turn_active = false;
+            playback_started = false;
+            underrun_reported = false;
+            playback_generation = audio_turn_generation;
+        }
+
+        uint32_t current_generation = audio_turn_generation;
+        if (current_generation != playback_generation) {
+            playback_generation = current_generation;
+            playback_started = false;
+            underrun_reported = false;
+        }
+
+        if (audio_stream == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        size_t pending = xStreamBufferBytesAvailable(audio_stream);
+
+        if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE &&
+            audio_turn_active && !audio_turn_complete_pending) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (playback_started && pending == 0 && audio_turn_active &&
+            !audio_turn_complete_pending) {
+            if (!underrun_reported) {
+                ESP_LOGW(TAG, "AUDIO PLAYBACK UNDERRUN: PCM buffer kosong di tengah turn");
+                underrun_reported = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
+            continue;
+        }
+
+        size_t received = xStreamBufferReceive(audio_stream, playback_buffer,
+                                               sizeof(playback_buffer),
+                                               pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
+        if (received == 0) {
+            check_audio_playback_complete();
+            vTaskDelay(1);
+            continue;
+        }
+        received &= ~((size_t)1);
+        if (received == 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (!playback_started) {
+            playback_started = true;
+            face_set_state(FACE_SPEAKING);
+        }
+        underrun_reported = false;
+        audio_write_speaker(playback_buffer, received);
+        audio_write_calls++;
+        audio_bytes_played += received;
+        check_audio_playback_complete();
+
+        int64_t now_us = esp_timer_get_time();
+        if (last_stats_us == 0 || now_us - last_stats_us >= 1000000) {
+            last_stats_us = now_us;
+            ESP_LOGI(TAG,
+                     "AUDIO FLOW: pending=%u/%u received=%llu queued=%llu played=%llu dropped=%llu",
+                     (unsigned)xStreamBufferBytesAvailable(audio_stream),
+                     (unsigned)AUDIO_RING_BUFFER_SIZE,
+                     (unsigned long long)audio_bytes_received,
+                     (unsigned long long)audio_bytes_queued,
+                     (unsigned long long)audio_bytes_played,
+                     (unsigned long long)audio_bytes_dropped);
+        }
+
+        if (!audio_turn_active && xStreamBufferBytesAvailable(audio_stream) == 0) {
+            playback_started = false;
+            underrun_reported = false;
+        }
+
+        vTaskDelay(1);
+    }
+}
+
+bool start_audio_playback(void)
+{
+    if (audio_stream != NULL) return true;
+    if (audio_send_mutex == NULL) {
+        audio_send_mutex = xSemaphoreCreateMutexStatic(&audio_send_mutex_storage);
+        if (audio_send_mutex == NULL) {
+            ESP_LOGE(TAG, "Gagal membuat audio send mutex");
+            return false;
+        }
+    }
+
+    uint8_t *buffer_mem = (uint8_t*)heap_caps_malloc(AUDIO_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (buffer_mem == NULL) {
+        buffer_mem = (uint8_t*)heap_caps_malloc(AUDIO_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL);
+        if (buffer_mem == NULL) {
+            ESP_LOGE(TAG, "Gagal alokasi %u byte untuk audio buffer",
+                     (unsigned)AUDIO_RING_BUFFER_SIZE);
+            return false;
+        }
+        ESP_LOGW(TAG, "Menggunakan RAM internal untuk audio buffer");
+    }
+
+    static StaticStreamBuffer_t stream_buffer_struct;
+    audio_stream = xStreamBufferCreateStatic(AUDIO_RING_BUFFER_SIZE,
+                                             AUDIO_PLAYBACK_TRIGGER_SIZE,
+                                             buffer_mem,
+                                             &stream_buffer_struct);
+    if (audio_stream == NULL) {
+        ESP_LOGE(TAG, "Gagal membuat static stream buffer");
+        heap_caps_free(buffer_mem);
         return false;
     }
 
-    s_running = true;
-    const BaseType_t result = xTaskCreate(
-        websocket_audio_task,
-        "ws_audio",
-        TASK_STACK,
-        nullptr,
-        TASK_PRIORITY,
-        &s_task);
-
+    BaseType_t result = xTaskCreatePinnedToCore(audio_playback_task, "audio_playback",
+                                                4096, NULL, 6,
+                                                &audio_playback_task_handle, 1);
     if (result != pdPASS) {
-        s_running = false;
-        s_task = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat task ws_audio");
+        ESP_LOGE(TAG, "Gagal membuat audio_task/playback task: free_internal=%u largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        vStreamBufferDelete(audio_stream);
+        audio_stream = NULL;
+        audio_playback_task_handle = NULL;
         return false;
     }
-
+    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=1 priority=6",
+             (unsigned)AUDIO_RING_BUFFER_SIZE,
+             (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
+             (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
     return true;
 }
 
-void websocket_audio_stop(void)
+void request_audio_buffer_clear(void) { audio_clear_pending = true; }
+
+void clear_audio_buffer(void)
 {
-    s_running = false;
+    audio_clear_pending = false;
+    if (audio_send_mutex != NULL) {
+        xSemaphoreTake(audio_send_mutex, portMAX_DELAY);
+        if (audio_stream != NULL) xStreamBufferReset(audio_stream);
+        xSemaphoreGive(audio_send_mutex);
+    } else if (audio_stream != NULL) {
+        xStreamBufferReset(audio_stream);
+    }
+    audio_turn_complete_pending = false;
+    audio_turn_active = false;
 }
 
-bool websocket_audio_running(void)
+void reset_audio_turn_stats(void)
 {
-    return s_running;
+    audio_chunks_received = 0;
+    audio_bytes_received = 0;
+    audio_bytes_queued = 0;
+    audio_write_calls = 0;
+    audio_bytes_played = 0;
+    audio_bytes_dropped = 0;
+    audio_turn_active = false;
+    audio_turn_complete_pending = false;
+}
+
+void begin_audio_turn(void)
+{
+    if (audio_turn_active) return;
+    audio_chunks_received = 0;
+    audio_bytes_received = 0;
+    audio_bytes_queued = 0;
+    audio_write_calls = 0;
+    audio_bytes_played = 0;
+    audio_bytes_dropped = 0;
+
+    if (audio_stream != NULL) {
+        size_t stale = xStreamBufferBytesAvailable(audio_stream);
+        if (stale > 0) {
+            xStreamBufferReset(audio_stream);
+            audio_bytes_dropped = stale;
+            ESP_LOGW(TAG, "Audio stale PCM dibuang saat turn baru: %u byte",
+                     (unsigned)stale);
+        }
+    }
+
+    uint32_t next_generation = audio_turn_generation + 1U;
+    if (next_generation == 0U) next_generation = 1U;
+    audio_turn_generation = next_generation;
+    audio_turn_active = true;
+    audio_turn_complete_pending = false;
+}
+
+bool queue_audio_pcm(const uint8_t *pcm, size_t len)
+{
+    if (pcm == NULL || len == 0) return false;
+    len &= ~((size_t)1);
+    if (len == 0) return false;
+    if (audio_stream == NULL && !start_audio_playback()) return false;
+    if (audio_stream == NULL) return false;
+    if (audio_send_mutex == NULL) {
+        ESP_LOGE(TAG, "Audio send mutex belum siap");
+        return false;
+    }
+    if (xSemaphoreTake(audio_send_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Gagal mengambil audio send mutex");
+        return false;
+    }
+
+    begin_audio_turn();
+
+    uint64_t queued_before = audio_bytes_queued;
+    uint64_t dropped_before = audio_bytes_dropped;
+
+    // Volume feature removed: Gemini PCM masuk ke playback tanpa modifikasi.
+    (void)send_realtime_pcm(pcm, len);
+
+    const uint64_t queued_delta = audio_bytes_queued - queued_before;
+    const uint64_t dropped_delta = audio_bytes_dropped - dropped_before;
+    const uint64_t accounted_delta = queued_delta + dropped_delta;
+    if (accounted_delta < (uint64_t)len) {
+        const uint64_t missing = (uint64_t)len - accounted_delta;
+        audio_bytes_dropped += missing;
+        ESP_LOGW(TAG, "Audio accounting guard: %llu byte -> dropped",
+                 (unsigned long long)missing);
+    } else if (accounted_delta > (uint64_t)len) {
+        ESP_LOGW(TAG,
+                 "Audio accounting anomaly: accounted_delta=%llu len=%u",
+                 (unsigned long long)accounted_delta, (unsigned)len);
+    }
+
+    xSemaphoreGive(audio_send_mutex);
+    return queued_delta == (uint64_t)len;
 }

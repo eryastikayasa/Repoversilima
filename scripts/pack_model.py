@@ -4,31 +4,49 @@ import argparse
 
 
 def struct_pack_string(string, max_len=None):
+    """
+    pack string to binary data.
+    if max_len is None, max_len = len(string) + 1
+    else len(string) < max_len, the left will be padded by struct.pack('x')
+
+    string: input python string
+    max_len: output
+    """
     if max_len is None:
         max_len = len(string)
     else:
         assert len(string) <= max_len
 
-    out_bytes = b""
+    left_num = max_len - len(string)
+    out_bytes = None
     for char in string:
-        out_bytes += struct.pack('b', ord(char))
-    out_bytes += b"\x00" * (max_len - len(string))
+        if out_bytes is None:
+            out_bytes = struct.pack('b', ord(char))
+        else:
+            out_bytes += struct.pack('b', ord(char))
+    for _ in range(left_num):
+        out_bytes += struct.pack('x')
     return out_bytes
 
 
 def read_data(filename):
+    """Read binary data, like index and model data."""
     with open(filename, "rb") as f:
         return f.read()
 
 
 def pack_models(model_path, out_file="srmodels.bin"):
+    """
+    Pack all models into one binary file using the ESP-SR model format.
+
+    The file order is deterministic and matches the known-good ESP-SR
+    model image layout: wn9_index, _MODEL_INFO_, then wn9_data.
+    """
     models = {}
     file_num = 0
 
     for root, dirs, _ in os.walk(model_path):
         for model_name in sorted(dirs):
-            if model_name == os.path.basename(out_file):
-                continue
             models[model_name] = {}
             model_dir = os.path.join(root, model_name)
             for _, _, files in os.walk(model_dir):
@@ -37,6 +55,8 @@ def pack_models(model_path, out_file="srmodels.bin"):
                     file_path = os.path.join(model_dir, file_name)
                     models[model_name][file_name] = read_data(file_path)
 
+    # Keep the single-model ESP-SR package layout identical to the
+    # known-good baseline artifact: index -> model info -> data.
     preferred_order = {
         "wn9_index": 0,
         "_MODEL_INFO_": 1,
@@ -81,8 +101,8 @@ def pack_models(model_path, out_file="srmodels.bin"):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ESP-SR model package tool")
-    parser.add_argument("-m", "--model_path", required=True)
-    parser.add_argument("-o", "--out_file", default="srmodels.bin")
+    parser = argparse.ArgumentParser(description='Model package tool')
+    parser.add_argument('-m', '--model_path', help="the path of model files")
+    parser.add_argument('-o', '--out_file', default="srmodels.bin", help="the path of the output binary file")
     args = parser.parse_args()
-    pack_models(args.model_path, args.out_file)
+    pack_models(model_path=args.model_path, out_file=args.out_file)
